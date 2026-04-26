@@ -1,0 +1,26 @@
+# Binaries
+bin/
+test_build
+rcp-light
+docs/
+RCP Light.app/
+
+# macOS
+.DS_Store
+
+# Build artifacts
+*.app/
+*.dmg
+
+# Go
+vendor/
+*.test
+*.out
+go.work
+go.work.sum
+
+# Local credentials (if any)
+*.cred
+*.ovpn
+*.log
+*.pid
