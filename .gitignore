@@ -24,3 +24,10 @@ go.work.sum
 *.ovpn
 *.log
 *.pid
+
+# Build Artifacts
+*.zip
+*.rb
+*.app/
+test_build
+rcp-light
