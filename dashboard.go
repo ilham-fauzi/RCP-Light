@@ -191,7 +191,7 @@ func (d *Dashboard) getHTML() string {
 <body class="bg-surface text-on-surface font-sans min-h-screen overflow-hidden select-none">
     <div id="app">
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
-            <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT</span>
+            <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.2.0</span>
             <div class="flex gap-4 items-center">
                 <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
                     <span class="material-symbols-outlined text-sm text-outline group-hover:text-primary transition-colors">person</span>
@@ -562,6 +562,13 @@ func (d *Dashboard) getHTML() string {
                 const k = e.key.toLowerCase();
                 if (k === 'v') document.execCommand('paste');
                 if (k === 'c') document.execCommand('copy');
+                if (k === 'x') document.execCommand('cut');
+                if (k === 'a') {
+                    if (document.activeElement && (document.activeElement.tagName === 'INPUT')) {
+                        document.activeElement.select();
+                        e.preventDefault();
+                    }
+                }
             }
             if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); }
         });
