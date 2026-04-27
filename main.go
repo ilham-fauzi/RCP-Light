@@ -152,11 +152,25 @@ func setupTouchID() {
 	exec.Command("osascript", "-e", fmt.Sprintf("do shell script \"%s\" with administrator privileges", cmd)).Run()
 }
 
-func ensureSudo() {
-	exec.Command("sudo", "-v").Run()
-	go func() {
-		for { exec.Command("sudo", "-n", "-v").Run(); time.Sleep(1 * time.Minute) }
-	}()
+func setupSudoers() {
+	ruleFile := "/etc/sudoers.d/rcp-light"
+	if _, err := os.Stat(ruleFile); err == nil { return }
+	
+	paths := map[string]bool{
+		"/opt/homebrew/sbin/openvpn": true,
+		"/usr/local/sbin/openvpn":    true,
+		"/usr/bin/kill":              true,
+		"/bin/kill":                  true,
+	}
+	if openvpnBin != "" { paths[openvpnBin] = true }
+	
+	var pathList []string
+	for p := range paths { pathList = append(pathList, p) }
+	
+	rule := fmt.Sprintf("%%admin ALL=(ALL) NOPASSWD: %s", strings.Join(pathList, ", "))
+	cmd := fmt.Sprintf("echo '%s' > /tmp/rcp-sudoers && chmod 440 /tmp/rcp-sudoers && chown root:wheel /tmp/rcp-sudoers && mv /tmp/rcp-sudoers %s", rule, ruleFile)
+	
+	exec.Command("osascript", "-e", fmt.Sprintf("do shell script \"%s\" with administrator privileges", cmd)).Run()
 }
 
 func closeTerminal() {
@@ -165,15 +179,27 @@ func closeTerminal() {
 	script := `
 	delay 0.1
 	tell application "Terminal"
-		if (count of windows) > 0 then
-			close front window saving no
-		end if
+		repeat with w in windows
+			try
+				if custom title of w is "RCP NETWORK" then
+					close w saving no
+					return
+				end if
+			end try
+		end repeat
 	end tell
 	try
 		tell application "iTerm"
-			if (count of windows) > 0 then
-				tell current session of current window to close
-			end if
+			repeat with w in windows
+				repeat with t in tabs of w
+					repeat with s in sessions of t
+						if name of s contains "RCP NETWORK" then
+							close s
+							return
+						end if
+					end repeat
+				end repeat
+			end repeat
 		end tell
 	end try`
 	exec.Command("osascript", "-e", script).Start()
@@ -182,10 +208,10 @@ func closeTerminal() {
 func main() {
 	initConfig()
 	checkEngine()
+	setupSudoers() // Ensure background processes and UI can run openvpn without password
 	if len(os.Args) > 1 && (os.Args[1] == "ui" || os.Args[1] == "mini" || os.Args[1] == "dashboard") {
 		if os.Args[1] == "mini" { miniMode = true }
 		startBackgroundSync()
-		ensureSudo()
 		if os.Args[1] == "dashboard" {
 			d := &Dashboard{}
 			d.Run()
@@ -206,21 +232,31 @@ func openDashboard() {
 
 func openTUI() {
 	exe, _ := os.Executable()
-	// Script AppleScript untuk:
-	// 1. Membersihkan layar
-	// 2. Mengatur ukuran jendela terminal (cols x rows)
-	// 3. Mematikan scrollback agar lebih bersih
-	// 4. Membawa ke depan
 	script := fmt.Sprintf(`
 		tell application "Terminal"
 			activate
-			set newWin to do script "printf '\\033c'; '%s' ui; exit"
-			tell window 1
-				set number of columns to 85
-				set number of rows to 25
-				set custom title to "RCP NETWORK"
-			end tell
-		end tell`, exe)
+			set found to false
+			repeat with w in windows
+				try
+					if custom title of w is "RCP NETWORK" then
+						set miniaturized of w to false
+						set index of w to 1
+						set found to true
+						exit repeat
+					end if
+				end try
+			end repeat
+			if found is false then
+				set newTab to do script "printf '\\033c'; '%s' ui; exit"
+				delay 0.5
+				set theWindow to window of newTab
+				set custom title of theWindow to "RCP NETWORK"
+				set number of columns of theWindow to 85
+				set number of rows of theWindow to 25
+				set index of theWindow to 1
+			end if
+		end tell
+		tell application "System Events" to set frontmost of process "Terminal" to true`, exe)
 	exec.Command("osascript", "-e", script).Run()
 }
 

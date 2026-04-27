@@ -137,6 +137,7 @@ func (d *Dashboard) Run() {
 	})
 
 	d.w.SetHtml(d.getHTML())
+	C.focus_window(d.w.Window())
 	d.w.Run()
 }
 
