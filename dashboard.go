@@ -54,6 +54,7 @@ func (d *Dashboard) Run() {
 	// Bindings
 	d.w.Bind("getVpnData", func() map[string]interface{} {
 		refreshProfiles()
+		loadSharedCredentials()
 		
 		stats := make(map[string]interface{})
 		for _, p := range profiles {
@@ -79,14 +80,14 @@ func (d *Dashboard) Run() {
 			"stats":      stats,
 			"configDir":  configDir,
 			"username":   username,
+			"sharedUser": sharedUser,
 			"sharedPass": sharedPass,
 		}
 	})
 
 	d.w.Bind("saveCredentials", func(newUsername string, newPassword string) {
 		saveUsername(newUsername)
-		sharedUser = newUsername
-		sharedPass = newPassword
+		saveSharedCredentials(newUsername, newPassword)
 	})
 
 	d.w.Bind("exitApp", func() {
@@ -105,12 +106,7 @@ func (d *Dashboard) Run() {
 	d.w.Bind("disconnect", func(profile string) {
 		C.focus_window(d.w.Window())
 		time.Sleep(200 * time.Millisecond)
-		pidPath := filepath.Join(configDir, profile+".pid")
-		if content, err := os.ReadFile(pidPath); err == nil {
-			pid := strings.TrimSpace(string(content))
-			if pid != "" { exec.Command("sudo", "kill", pid).Run() }
-			os.Remove(pidPath)
-		}
+		disconnectVPN(profile) // stops watchdog + kills openvpn process
 	})
 
 	d.w.Bind("importProfile", func() map[string]string {
@@ -196,9 +192,9 @@ func (d *Dashboard) getHTML() string {
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
             <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.2.0</span>
             <div class="flex gap-4 items-center">
-                <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
-                    <span class="material-symbols-outlined text-sm text-outline group-hover:text-primary transition-colors">person</span>
-                    <span id="header-username" class="text-[10px] font-mono text-outline uppercase tracking-wider group-hover:text-on-surface">---</span>
+                <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
+                    <span class="material-symbols-outlined text-[12px] text-outline group-hover:text-primary transition-colors">person</span>
+                    <span id="header-username" class="text-[10px] font-mono text-outline uppercase tracking-wider group-hover:text-on-surface leading-none">---</span>
                 </div>
                 <span onclick="refresh()" class="material-symbols-outlined text-slate-500 cursor-pointer hover:text-primary transition-colors">refresh</span>
             </div>
@@ -291,7 +287,8 @@ func (d *Dashboard) getHTML() string {
                     </label>
 
                     <button id="auth-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest shadow-lg active:scale-95 transition-all mt-2">Authorize Connection</button>
-                    <button onclick="closeModal()" class="w-full text-[10px] text-outline uppercase">Cancel</button>
+                    <div class="h-2"></div>
+                    <button onclick="closeModal()" class="w-full text-[10px] text-outline uppercase hover:text-white transition-colors py-2">Cancel</button>
                 </div>
             </div>
         </div>
@@ -349,7 +346,7 @@ func (d *Dashboard) getHTML() string {
                  globalUsername = data.username || 'vpnuser';
                  document.getElementById('header-username').innerText = globalUsername;
                  sharedPassword = data.sharedPass || '';
-                 sharedUsername = globalUsername;
+                 sharedUsername = data.sharedUser || globalUsername;
                  
                  const profiles = data.profiles || [];
                 currentStats = data.stats || {};
@@ -490,7 +487,7 @@ func (d *Dashboard) getHTML() string {
             userField.value = sharedUsername || globalUsername;
             
             const passField = document.getElementById('vpn-password');
-            passField.value = ''; // Always empty in UI for better security/UX
+            passField.value = sharedPassword || ''; // Pre-fill synced token visually
             
             document.getElementById('apply-to-all').checked = !!sharedPassword;
             document.getElementById('password-modal').classList.remove('hidden');
