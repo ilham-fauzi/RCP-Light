@@ -49,7 +49,7 @@ cat << PLIST > "${APP_DIR}/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2</string>
+    <string>1.3.0</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
