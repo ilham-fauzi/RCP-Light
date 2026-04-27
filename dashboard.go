@@ -75,15 +75,18 @@ func (d *Dashboard) Run() {
 		}
 
 		return map[string]interface{}{
-			"profiles":  profiles,
-			"stats":     stats,
-			"configDir": configDir,
-			"username":  username,
+			"profiles":   profiles,
+			"stats":      stats,
+			"configDir":  configDir,
+			"username":   username,
+			"sharedPass": sharedPass,
 		}
 	})
 
-	d.w.Bind("saveUsername", func(newUsername string) {
+	d.w.Bind("saveCredentials", func(newUsername string, newPassword string) {
 		saveUsername(newUsername)
+		sharedUser = newUsername
+		sharedPass = newPassword
 	})
 
 	d.w.Bind("exitApp", func() {
@@ -311,11 +314,18 @@ func (d *Dashboard) getHTML() string {
             <div class="w-full max-w-sm mx-4 glass-panel rounded-xl overflow-hidden shadow-2xl border border-primary/20">
                 <div class="p-6 border-b border-white/5">
                     <span class="text-[10px] font-label-caps text-outline uppercase tracking-widest">Global Credentials</span>
-                    <h1 class="text-xl font-bold text-on-surface mt-1">EDIT USERNAME</h1>
+                    <h1 class="text-xl font-bold text-on-surface mt-1">EDIT CREDENTIALS</h1>
                 </div>
                 <div class="p-6 flex flex-col gap-4">
-                    <input id="new-username" type="text" class="w-full bg-white/5 border-b border-primary/30 p-2 text-xl font-bold outline-none focus:border-primary transition-all text-center">
-                    <button id="save-username-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest active:scale-95 transition-all">Update Username</button>
+                    <div class="flex flex-col gap-1">
+                        <span class="text-[9px] text-outline uppercase tracking-widest px-1">Username</span>
+                        <input id="new-username" type="text" class="w-full bg-white/5 border-b border-primary/30 p-2 text-lg font-bold outline-none focus:border-primary transition-all text-center">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <span class="text-[9px] text-outline uppercase tracking-widest px-1">Token / Password</span>
+                        <input id="new-password" type="password" placeholder="LEAVE EMPTY TO CLEAR" class="w-full bg-white/5 border-b border-primary/30 p-2 text-lg tracking-[0.3em] outline-none focus:border-primary transition-all text-center">
+                    </div>
+                    <button id="save-username-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest active:scale-95 transition-all mt-2">Update Credentials</button>
                     <button onclick="closeUsernameModal()" class="w-full text-[10px] text-outline uppercase">Cancel</button>
                 </div>
             </div>
@@ -338,6 +348,8 @@ func (d *Dashboard) getHTML() string {
                  document.getElementById('path-info').innerText = 'CONFIG_PATH: ' + data.configDir;
                  globalUsername = data.username || 'vpnuser';
                  document.getElementById('header-username').innerText = globalUsername;
+                 sharedPassword = data.sharedPass || '';
+                 sharedUsername = globalUsername;
                  
                  const profiles = data.profiles || [];
                 currentStats = data.stats || {};
@@ -536,6 +548,7 @@ func (d *Dashboard) getHTML() string {
 
         function openUsernameModal() {
             document.getElementById('new-username').value = document.getElementById('header-username').innerText;
+            document.getElementById('new-password').value = sharedPassword;
             document.getElementById('username-modal').classList.remove('hidden');
             document.getElementById('new-username').focus();
         }
@@ -544,8 +557,9 @@ func (d *Dashboard) getHTML() string {
 
         document.getElementById('save-username-btn').onclick = async () => {
             const name = document.getElementById('new-username').value.trim();
+            const pass = document.getElementById('new-password').value;
             if (name) {
-                await saveUsername(name);
+                await saveCredentials(name, pass);
                 closeUsernameModal();
                 refresh();
             }
@@ -562,6 +576,11 @@ func (d *Dashboard) getHTML() string {
         };
 
         document.getElementById('new-username').onkeydown = (e) => {
+            if (e.key === 'Enter') document.getElementById('save-username-btn').click();
+            if (e.key === 'Escape') closeUsernameModal();
+        };
+
+        document.getElementById('new-password').onkeydown = (e) => {
             if (e.key === 'Enter') document.getElementById('save-username-btn').click();
             if (e.key === 'Escape') closeUsernameModal();
         };

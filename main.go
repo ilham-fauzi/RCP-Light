@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -42,21 +43,21 @@ var (
 	globalNetStats = make(map[string]*NetStats)
 
 	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#5F5CF1")).Padding(0, 1).Bold(true)
-	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Background(lipgloss.Color("#0F1419")).Bold(true)
-	itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#0F1419"))
-	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Background(lipgloss.Color("#0F1419")).PaddingLeft(2)
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Background(lipgloss.Color("#0F1419")).Bold(true).PaddingLeft(2)
-	keyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Background(lipgloss.Color("#0F1419")).Bold(true)
-	descStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA")).Background(lipgloss.Color("#0F1419"))
-	footerStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true, false, false, false).BorderForeground(lipgloss.Color("#333333")).Background(lipgloss.Color("#0F1419")).MarginTop(1).PaddingTop(1)
-	mainBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#5F5CF1")).Background(lipgloss.Color("#0F1419")).Padding(1, 2).Width(80)
-	miniBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#00FF88")).Background(lipgloss.Color("#0F1419")).Padding(0, 1)
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#333333")).Background(lipgloss.Color("#0F1419"))
-	midStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#005F87")).Background(lipgloss.Color("#0F1419"))
-	brightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Background(lipgloss.Color("#0F1419")).Bold(true)
-	ipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Background(lipgloss.Color("#0F1419")).Italic(true)
-	downStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAC1C")).Background(lipgloss.Color("#0F1419"))
-	upStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#1C93FF")).Background(lipgloss.Color("#0F1419"))
+	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
+	itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).PaddingLeft(2)
+	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true).PaddingLeft(2)
+	keyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Bold(true)
+	descStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA"))
+	footerStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true, false, false, false).BorderForeground(lipgloss.Color("#333333")).MarginTop(1).PaddingTop(1)
+	mainBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#5F5CF1")).Padding(1, 2).Width(80)
+	miniBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#00FF88")).Padding(0, 1)
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#333333"))
+	midStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#005F87"))
+	brightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
+	ipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Italic(true)
+	downStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAC1C"))
+	upStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#1C93FF"))
 
 	sharedUser string
 	sharedPass string
@@ -217,6 +218,22 @@ func main() {
 			d.Run()
 			return
 		}
+		
+		// Resize the terminal window to be compact if running UI
+		if os.Args[1] == "ui" {
+			rows := 15 + len(profiles)
+			if rows < 16 {
+				rows = 16
+			}
+			if rows > 35 {
+				rows = 35
+			}
+			// Resize terminal window
+			fmt.Printf("\033[8;%d;85t", rows)
+			// Set terminal window title
+			fmt.Printf("\033]0;RCP Light\007")
+		}
+		
 		tea.NewProgram(initialModel()).Run()
 	} else {
 		startBackgroundSync()
@@ -232,9 +249,25 @@ func openDashboard() {
 
 func openTUI() {
 	exe, _ := os.Executable()
+	rows := 15 + len(profiles)
+	if rows < 16 {
+		rows = 16
+	}
+	if rows > 35 {
+		rows = 35
+	}
 	script := fmt.Sprintf(`
+		tell application "System Events"
+			set isRunning to (count of (every process whose name is "Terminal")) > 0
+		end tell
 		tell application "Terminal"
 			activate
+			if not isRunning then
+				repeat until (count of windows) > 0
+					delay 0.1
+				end repeat
+			end if
+			
 			set found to false
 			repeat with w in windows
 				try
@@ -246,17 +279,23 @@ func openTUI() {
 					end if
 				end try
 			end repeat
+			
 			if found is false then
-				set newTab to do script "printf '\\033c'; '%s' ui; exit"
+				if not isRunning then
+					do script "printf '\\033c'; exec '%[1]s' ui" in window 1
+					set theWindow to window 1
+				else
+					set newTab to do script "printf '\\033c'; exec '%[1]s' ui"
+					set theWindow to window of newTab
+				end if
 				delay 0.5
-				set theWindow to window of newTab
 				set custom title of theWindow to "RCP NETWORK"
 				set number of columns of theWindow to 85
-				set number of rows of theWindow to 25
+				set number of rows of theWindow to %[2]d
 				set index of theWindow to 1
 			end if
 		end tell
-		tell application "System Events" to set frontmost of process "Terminal" to true`, exe)
+		tell application "System Events" to set frontmost of process "Terminal" to true`, exe, rows)
 	exec.Command("osascript", "-e", script).Run()
 }
 
@@ -266,7 +305,9 @@ func isProfileConnected(profile string) bool {
 	if err != nil { return false }
 	pid := strings.TrimSpace(string(content))
 	if pid == "" { return false }
-	out, _ := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+	cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, _ := cmd.Output()
 	return strings.Contains(string(out), "openvpn")
 }
 
@@ -282,7 +323,9 @@ func getVPNIPFromLog(profile string) string {
 
 func findInterfaceByIP(ip string) string {
 	if ip == "" { return "" }
-	out, err := exec.Command("ifconfig").Output()
+	cmd := exec.Command("ifconfig")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, err := cmd.Output()
 	if err != nil { return "" }
 	lines := strings.Split(string(out), "\n")
 	var currentIface string
@@ -298,7 +341,9 @@ func findInterfaceByIP(ip string) string {
 
 func updateNetStats(s *NetStats) {
 	if s.Interface == "" { return }
-	out, err := exec.Command("netstat", "-I", s.Interface, "-b", "-n", "-f", "link").Output()
+	cmd := exec.Command("netstat", "-I", s.Interface, "-b", "-n", "-f", "link")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, err := cmd.Output()
 	if err != nil { return }
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) < 2 { return }
