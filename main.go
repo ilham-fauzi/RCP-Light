@@ -531,14 +531,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = stateConnUser; m.input.EchoMode = textinput.EchoNormal
 					m.input.Prompt = ""; val := sharedUser; if val == "" { val = username }
 					m.input.SetValue(val); m.input.Focus()
+					m.input.SetCursor(len(val))
 					m.applyAll = (sharedPass != "")
 				}
 			} else if m.state == stateConnUser {
 				m.tempUser = m.input.Value()
 				m.state = stateConnPass; m.input.EchoMode = textinput.EchoPassword
-				m.input.Prompt = ""; m.input.SetValue(sharedPass); m.input.Focus()
+				m.input.Prompt = ""; m.input.SetValue(""); m.input.Focus()
 			} else if m.state == stateConnPass {
 				m.tempPass = m.input.Value()
+				// If input is empty but we have a shared password, use the shared one
+				if m.tempPass == "" && sharedPass != "" {
+					m.tempPass = sharedPass
+				}
 				m.state = stateConnecting; p := m.choices[m.cursor]
 				if m.applyAll { sharedUser = m.tempUser; sharedPass = m.tempPass }
 				return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
@@ -602,7 +607,7 @@ func (m model) View() string {
 	
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		titleStyle.Render(" RCP "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("LIGHT VPN v1.2"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.2.0"),
 	) + "\n\n"
 
 	if m.state == stateRenameImport {

@@ -474,26 +474,35 @@ func (d *Dashboard) getHTML() string {
             selectedProfile = p;
             document.getElementById('modal-profile-name').innerText = 'Profile: ' + p;
             
-            // Pre-fill with shared credentials if available, otherwise use global default
-            document.getElementById('vpn-username').value = sharedUsername || globalUsername;
-            document.getElementById('vpn-password').value = sharedPassword || '';
+            const userField = document.getElementById('vpn-username');
+            userField.value = sharedUsername || globalUsername;
             
-            // Keep checkbox checked if we have shared credentials
+            const passField = document.getElementById('vpn-password');
+            passField.value = ''; // Always empty in UI for better security/UX
+            
             document.getElementById('apply-to-all').checked = !!sharedPassword;
-            
             document.getElementById('password-modal').classList.remove('hidden');
             
             if (document.getElementById('auth-btn').innerText !== 'AUTHORIZING...') {
                 document.getElementById('auth-error').classList.add('hidden');
             }
-            document.getElementById('vpn-password').focus();
+            
+            // Focus and select username
+            userField.focus();
+            userField.select();
         }
 
         function closeModal() { document.getElementById('password-modal').classList.add('hidden'); }
 
         document.getElementById('auth-btn').onclick = async () => {
             const user = document.getElementById('vpn-username').value.trim();
-            const pwd = document.getElementById('vpn-password').value;
+            let pwd = document.getElementById('vpn-password').value;
+            
+            // If user left password empty, use the shared one from background
+            if (!pwd && sharedPassword) {
+                pwd = sharedPassword;
+            }
+            
             if (!user || !pwd) return;
             
             if (document.getElementById('apply-to-all').checked) {
