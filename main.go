@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -31,6 +33,12 @@ type NetStats struct {
 
 // === Global Variables ===
 
+// credStore holds credentials for auto-reconnect watchdog
+type vpnCred struct {
+	user string
+	pass string
+}
+
 var (
 	configDir  string
 	openvpnBin string
@@ -38,8 +46,12 @@ var (
 	profileMap map[string]string
 	username   string
 	miniMode   bool
-	
+
 	globalNetStats = make(map[string]*NetStats)
+
+	// activeConnections tracks profiles that should remain connected (for auto-reconnect)
+	activeConnections   = make(map[string]vpnCred)
+	activeConnMu        sync.Mutex
 
 	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#5F5CF1")).Padding(0, 1).Bold(true)
 	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
@@ -47,11 +59,11 @@ var (
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).PaddingLeft(2)
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true).PaddingLeft(2)
 	keyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Bold(true)
-	descStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
+	descStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA"))
 	footerStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true, false, false, false).BorderForeground(lipgloss.Color("#333333")).MarginTop(1).PaddingTop(1)
 	mainBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#5F5CF1")).Padding(1, 2).Width(80)
 	miniBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#00FF88")).Padding(0, 1)
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#222222"))
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#333333"))
 	midStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#005F87"))
 	brightStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
 	ipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Italic(true)
@@ -72,12 +84,32 @@ func initConfig() {
 	credPath := filepath.Join(configDir, "username.cred")
 	content, err := os.ReadFile(credPath)
 	if err == nil { username = strings.TrimSpace(string(content)) } else { username = "vpnuser" }
+	loadSharedCredentials()
 }
 
 func saveUsername(newUsername string) {
 	username = strings.TrimSpace(newUsername)
 	credPath := filepath.Join(configDir, "username.cred")
 	os.WriteFile(credPath, []byte(username), 0644)
+}
+
+func loadSharedCredentials() {
+	path := filepath.Join(configDir, "session.cred")
+	content, err := os.ReadFile(path)
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		if len(lines) >= 2 {
+			sharedUser = strings.TrimSpace(lines[0])
+			sharedPass = strings.TrimSpace(lines[1])
+		}
+	}
+}
+
+func saveSharedCredentials(u, p string) {
+	sharedUser = u
+	sharedPass = p
+	path := filepath.Join(configDir, "session.cred")
+	os.WriteFile(path, []byte(u+"\n"+p), 0600)
 }
 
 func refreshProfiles() {
@@ -133,7 +165,11 @@ func sanitizeOvpn(filePath string) error {
 	if err != nil { return err }
 	lines := strings.Split(string(content), "\n")
 	var newLines []string
-	reRemove := regexp.MustCompile(`(?i)^(--)?(client-cert-not-required|verify-client-cert|persist-key|persist-tun|route-method|route-delay)`)
+	// NOTE: persist-key and persist-tun are intentionally NOT removed — they are essential
+	// for connection resilience when network is interrupted (laptop sleep, brief disconnects).
+	// persist-key  → keeps TLS keys in memory so re-auth is not needed after network recovery
+	// persist-tun  → keeps TUN interface open so the tunnel can resume without full restart
+	reRemove := regexp.MustCompile(`(?i)^(--)?(client-cert-not-required|verify-client-cert|route-method|route-delay)`)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") { newLines = append(newLines, line); continue }
@@ -152,11 +188,25 @@ func setupTouchID() {
 	exec.Command("osascript", "-e", fmt.Sprintf("do shell script \"%s\" with administrator privileges", cmd)).Run()
 }
 
-func ensureSudo() {
-	exec.Command("sudo", "-v").Run()
-	go func() {
-		for { exec.Command("sudo", "-n", "-v").Run(); time.Sleep(1 * time.Minute) }
-	}()
+func setupSudoers() {
+	ruleFile := "/etc/sudoers.d/rcp-light"
+	if _, err := os.Stat(ruleFile); err == nil { return }
+	
+	paths := map[string]bool{
+		"/opt/homebrew/sbin/openvpn": true,
+		"/usr/local/sbin/openvpn":    true,
+		"/usr/bin/kill":              true,
+		"/bin/kill":                  true,
+	}
+	if openvpnBin != "" { paths[openvpnBin] = true }
+	
+	var pathList []string
+	for p := range paths { pathList = append(pathList, p) }
+	
+	rule := fmt.Sprintf("%%admin ALL=(ALL) NOPASSWD: %s", strings.Join(pathList, ", "))
+	cmd := fmt.Sprintf("echo '%s' > /tmp/rcp-sudoers && chmod 440 /tmp/rcp-sudoers && chown root:wheel /tmp/rcp-sudoers && mv /tmp/rcp-sudoers %s", rule, ruleFile)
+	
+	exec.Command("osascript", "-e", fmt.Sprintf("do shell script \"%s\" with administrator privileges", cmd)).Run()
 }
 
 func closeTerminal() {
@@ -165,15 +215,27 @@ func closeTerminal() {
 	script := `
 	delay 0.1
 	tell application "Terminal"
-		if (count of windows) > 0 then
-			close front window saving no
-		end if
+		repeat with w in windows
+			try
+				if custom title of w is "RCP NETWORK" then
+					close w saving no
+					return
+				end if
+			end try
+		end repeat
 	end tell
 	try
 		tell application "iTerm"
-			if (count of windows) > 0 then
-				tell current session of current window to close
-			end if
+			repeat with w in windows
+				repeat with t in tabs of w
+					repeat with s in sessions of t
+						if name of s contains "RCP NETWORK" then
+							close s
+							return
+						end if
+					end repeat
+				end repeat
+			end repeat
 		end tell
 	end try`
 	exec.Command("osascript", "-e", script).Start()
@@ -182,15 +244,40 @@ func closeTerminal() {
 func main() {
 	initConfig()
 	checkEngine()
+	setupSudoers()
+
+	// Subprocess mode: show login window for a specific profile (called from tray click)
+	if len(os.Args) > 2 && os.Args[1] == "connect-ui" {
+		profile := os.Args[2]
+		refreshProfiles()
+		defU := sharedUser; if defU == "" { defU = username }
+		res := showLoginWindow(profile, defU, sharedPass)
+		if !res.canceled {
+			if res.applyAll {
+				saveSharedCredentials(res.user, res.password)
+			}
+			connectVPN(profile, res.user, res.password)
+		}
+		return
+	}
+
 	if len(os.Args) > 1 && (os.Args[1] == "ui" || os.Args[1] == "mini" || os.Args[1] == "dashboard") {
 		if os.Args[1] == "mini" { miniMode = true }
 		startBackgroundSync()
-		ensureSudo()
 		if os.Args[1] == "dashboard" {
 			d := &Dashboard{}
 			d.Run()
 			return
 		}
+
+		if os.Args[1] == "ui" {
+			rows := 15 + len(profiles)
+			if rows < 16 { rows = 16 }
+			if rows > 35 { rows = 35 }
+			fmt.Printf("\033[8;%d;85t", rows)
+			fmt.Printf("\033]0;RCP Light\007")
+		}
+
 		tea.NewProgram(initialModel()).Run()
 	} else {
 		startBackgroundSync()
@@ -204,23 +291,63 @@ func openDashboard() {
 	exec.Command(exe, "dashboard").Start()
 }
 
+// openLoginWindowSubprocess launches the login window in a fresh subprocess.
+// This is required because NSWindow must be created on the main thread,
+// which is already owned by systray in the tray process.
+func openLoginWindowSubprocess(profile string) {
+	exe, _ := os.Executable()
+	exec.Command(exe, "connect-ui", profile).Start()
+}
+
 func openTUI() {
 	exe, _ := os.Executable()
-	// Script AppleScript untuk:
-	// 1. Membersihkan layar
-	// 2. Mengatur ukuran jendela terminal (cols x rows)
-	// 3. Mematikan scrollback agar lebih bersih
-	// 4. Membawa ke depan
+	rows := 15 + len(profiles)
+	if rows < 16 {
+		rows = 16
+	}
+	if rows > 35 {
+		rows = 35
+	}
 	script := fmt.Sprintf(`
+		tell application "System Events"
+			set isRunning to (count of (every process whose name is "Terminal")) > 0
+		end tell
 		tell application "Terminal"
 			activate
-			set newWin to do script "printf '\\033c'; '%s' ui; exit"
-			tell window 1
-				set number of columns to 85
-				set number of rows to 25
-				set custom title to "RCP NETWORK"
-			end tell
-		end tell`, exe)
+			if not isRunning then
+				repeat until (count of windows) > 0
+					delay 0.1
+				end repeat
+			end if
+			
+			set found to false
+			repeat with w in windows
+				try
+					if custom title of w is "RCP NETWORK" then
+						set miniaturized of w to false
+						set index of w to 1
+						set found to true
+						exit repeat
+					end if
+				end try
+			end repeat
+			
+			if found is false then
+				if not isRunning then
+					do script "printf '\\033c'; exec '%[1]s' ui" in window 1
+					set theWindow to window 1
+				else
+					set newTab to do script "printf '\\033c'; exec '%[1]s' ui"
+					set theWindow to window of newTab
+				end if
+				delay 0.5
+				set custom title of theWindow to "RCP NETWORK"
+				set number of columns of theWindow to 85
+				set number of rows of theWindow to %[2]d
+				set index of theWindow to 1
+			end if
+		end tell
+		tell application "System Events" to set frontmost of process "Terminal" to true`, exe, rows)
 	exec.Command("osascript", "-e", script).Run()
 }
 
@@ -230,7 +357,9 @@ func isProfileConnected(profile string) bool {
 	if err != nil { return false }
 	pid := strings.TrimSpace(string(content))
 	if pid == "" { return false }
-	out, _ := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+	cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, _ := cmd.Output()
 	return strings.Contains(string(out), "openvpn")
 }
 
@@ -246,7 +375,9 @@ func getVPNIPFromLog(profile string) string {
 
 func findInterfaceByIP(ip string) string {
 	if ip == "" { return "" }
-	out, err := exec.Command("ifconfig").Output()
+	cmd := exec.Command("ifconfig")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, err := cmd.Output()
 	if err != nil { return "" }
 	lines := strings.Split(string(out), "\n")
 	var currentIface string
@@ -262,7 +393,9 @@ func findInterfaceByIP(ip string) string {
 
 func updateNetStats(s *NetStats) {
 	if s.Interface == "" { return }
-	out, err := exec.Command("netstat", "-I", s.Interface, "-b", "-n", "-f", "link").Output()
+	cmd := exec.Command("netstat", "-I", s.Interface, "-b", "-n", "-f", "link")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, err := cmd.Output()
 	if err != nil { return }
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) < 2 { return }
@@ -293,22 +426,38 @@ func connectVPN(profile string, user string, password string) error {
 	pidPath := filepath.Join(configDir, profile+".pid")
 	os.Remove(logPath); os.Remove(pidPath)
 	os.WriteFile(logPath, []byte(""), 0666)
-	tmpAuthPath := filepath.Join(configDir, ".tmp_auth")
-	os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0666)
-	os.Chmod(tmpAuthPath, 0644)
-	
-	cmd := exec.Command("sudo", openvpnBin, "--config", ovpnPath, "--auth-user-pass", tmpAuthPath, "--daemon", "--log", logPath, "--writepid", pidPath)
+	tmpAuthPath := filepath.Join(configDir, ".tmp_auth_"+profile)
+	os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
+
+	cmd := exec.Command("sudo", openvpnBin,
+		"--config", ovpnPath,
+		"--auth-user-pass", tmpAuthPath,
+		"--daemon",
+		"--log", logPath,
+		"--writepid", pidPath,
+		// Persistence across network interruptions (laptop sleep, brief disconnects)
+		"--persist-key",         // keep TLS keys in memory; no re-auth needed after recovery
+		"--persist-tun",         // keep TUN device open across reconnects
+		// Keepalive: ping every 10s, restart tunnel if no response for 120s
+		"--keepalive", "10", "120",
+		// Retry DNS resolution indefinitely — critical when internet returns after a drop
+		"--resolv-retry", "infinite",
+		// Retry connection every 5 seconds on failure
+		"--connect-retry", "5",
+		"--connect-retry-max", "0", // 0 = unlimited retries
+		// Disable inactivity timeout
+		"--inactive", "0",
+	)
 	_, err := cmd.CombinedOutput()
-	if err != nil { 
+	if err != nil {
 		os.Remove(tmpAuthPath)
-		return fmt.Errorf("OpenVPN Start Error: %v", err) 
+		return fmt.Errorf("OpenVPN Start Error: %v", err)
 	}
 
 	// Wait and check if it survives or fails auth
 	for i := 0; i < 10; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if !isProfileConnected(profile) {
-			// Process exited, check log for reason
 			logContent, _ := os.ReadFile(logPath)
 			if strings.Contains(string(logContent), "AUTH_FAILED") {
 				os.Remove(tmpAuthPath)
@@ -317,15 +466,103 @@ func connectVPN(profile string, user string, password string) error {
 			os.Remove(tmpAuthPath)
 			return fmt.Errorf("Connection terminated unexpectedly")
 		}
-		// If log contains "Initialization Sequence Completed", we're good
 		logContent, _ := os.ReadFile(logPath)
 		if strings.Contains(string(logContent), "Initialization Sequence Completed") {
 			break
 		}
 	}
 
-	go func() { time.Sleep(10 * time.Second); os.Remove(tmpAuthPath) }()
+	// Register credentials for watchdog auto-reconnect
+	activeConnMu.Lock()
+	activeConnections[profile] = vpnCred{user: user, pass: password}
+	activeConnMu.Unlock()
+
+	// Start per-profile watchdog goroutine
+	go vpnWatchdog(profile)
+
+	// Clean up auth file after a short delay
+	go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
 	return nil
+}
+
+// vpnWatchdog monitors a connected profile and auto-reconnects if it drops unexpectedly.
+// It stops when the profile is no longer in activeConnections (i.e., user disconnected).
+func vpnWatchdog(profile string) {
+	// Grace period before first check
+	time.Sleep(10 * time.Second)
+	for {
+		activeConnMu.Lock()
+		cred, shouldWatch := activeConnections[profile]
+		activeConnMu.Unlock()
+
+		if !shouldWatch {
+			// User explicitly disconnected — stop watchdog
+			return
+		}
+
+		if !isProfileConnected(profile) {
+			// Connection dropped unexpectedly — attempt reconnect
+			// Brief wait to let network settle (e.g. after wake from sleep)
+			time.Sleep(5 * time.Second)
+
+			activeConnMu.Lock()
+			_, stillActive := activeConnections[profile]
+			activeConnMu.Unlock()
+			if !stillActive { return }
+
+			// Try to reconnect (ignore errors — watchdog will retry next cycle)
+			_ = connectVPNDirect(profile, cred.user, cred.pass)
+		}
+
+		time.Sleep(15 * time.Second)
+	}
+}
+
+// connectVPNDirect reconnects without re-registering the watchdog (called from watchdog itself).
+func connectVPNDirect(profile string, user string, password string) error {
+	ovpnFile := profileMap[profile]
+	if ovpnFile == "" { return fmt.Errorf("profile not found") }
+	ovpnPath := filepath.Join(configDir, ovpnFile)
+	logPath := filepath.Join(configDir, profile+".log")
+	pidPath := filepath.Join(configDir, profile+".pid")
+	os.Remove(logPath); os.Remove(pidPath)
+	os.WriteFile(logPath, []byte(""), 0666)
+	tmpAuthPath := filepath.Join(configDir, ".tmp_auth_"+profile)
+	os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
+
+	cmd := exec.Command("sudo", openvpnBin,
+		"--config", ovpnPath,
+		"--auth-user-pass", tmpAuthPath,
+		"--daemon",
+		"--log", logPath,
+		"--writepid", pidPath,
+		"--persist-key",
+		"--persist-tun",
+		"--keepalive", "10", "120",
+		"--resolv-retry", "infinite",
+		"--connect-retry", "5",
+		"--connect-retry-max", "0",
+		"--inactive", "0",
+	)
+	_, err := cmd.CombinedOutput()
+	go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
+	return err
+}
+
+// disconnectVPN explicitly stops a VPN connection and deregisters it from the watchdog,
+// so the auto-reconnect goroutine will exit cleanly.
+func disconnectVPN(profile string) {
+	// Deregister FIRST so watchdog knows this is intentional and stops
+	activeConnMu.Lock()
+	delete(activeConnections, profile)
+	activeConnMu.Unlock()
+
+	pidPath := filepath.Join(configDir, profile+".pid")
+	if content, err := os.ReadFile(pidPath); err == nil {
+		pid := strings.TrimSpace(string(content))
+		if pid != "" { exec.Command("sudo", "kill", pid).Run() }
+		os.Remove(pidPath)
+	}
 }
 
 func onTrayReady() {
@@ -347,20 +584,12 @@ func onTrayReady() {
 		go func(p string, m *systray.MenuItem) {
 			for {
 				<-m.ClickedCh
-				if isProfileConnected(p) { 
-					pidPath := filepath.Join(configDir, p+".pid")
-					if content, err := os.ReadFile(pidPath); err == nil {
-						pid := strings.TrimSpace(string(content))
-						if pid != "" { exec.Command("sudo", "kill", pid).Run() }
-						os.Remove(pidPath)
-					}
+				if isProfileConnected(p) {
+					disconnectVPN(p)
 				} else {
-					script := `display dialog "Enter VPN Token:" default answer "" with hidden answer`
-					out, err := exec.Command("osascript", "-e", script).Output()
-					if err == nil && strings.Contains(string(out), "text returned:") {
-						token := strings.TrimSpace(strings.Split(string(out), "text returned:")[1])
-						connectVPN(p, username, token)
-					}
+					// Launch login window in a subprocess — webview requires the main thread
+					// which is already owned by systray in this process.
+					openLoginWindowSubprocess(p)
 				}
 				updateTray()
 			}
@@ -466,12 +695,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "y":
 			if m.state == stateConfirmDelete {
 				p := m.choices[m.cursor]
-				pidPath := filepath.Join(configDir, p+".pid")
-				if content, err := os.ReadFile(pidPath); err == nil {
-					pid := strings.TrimSpace(string(content))
-					if pid != "" { exec.Command("sudo", "kill", pid).Run() }
-					os.Remove(pidPath)
-				}
+				disconnectVPN(p) // also stops watchdog
 				os.Remove(filepath.Join(configDir, profileMap[p]))
 				m.state = stateSelect; if m.cursor >= len(m.choices) && m.cursor > 0 { m.cursor-- }
 			}
@@ -484,27 +708,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSelect || m.state == stateError {
 				if len(m.choices) == 0 { return m, nil }
 				p := m.choices[m.cursor]
-				if isProfileConnected(p) { 
-					pidPath := filepath.Join(configDir, p+".pid")
-					if content, err := os.ReadFile(pidPath); err == nil {
-						pid := strings.TrimSpace(string(content))
-						if pid != "" { exec.Command("sudo", "kill", pid).Run() }
-						os.Remove(pidPath)
-					}
+				if isProfileConnected(p) {
+					disconnectVPN(p) // stops watchdog + kills process
 				} else { 
 					m.state = stateConnUser; m.input.EchoMode = textinput.EchoNormal
 					m.input.Prompt = ""; val := sharedUser; if val == "" { val = username }
 					m.input.SetValue(val); m.input.Focus()
+					m.input.SetCursor(len(val))
 					m.applyAll = (sharedPass != "")
 				}
 			} else if m.state == stateConnUser {
 				m.tempUser = m.input.Value()
 				m.state = stateConnPass; m.input.EchoMode = textinput.EchoPassword
-				m.input.Prompt = ""; m.input.SetValue(sharedPass); m.input.Focus()
+				m.input.Prompt = ""; m.input.SetValue(""); m.input.Focus()
 			} else if m.state == stateConnPass {
 				m.tempPass = m.input.Value()
+				// If input is empty but we have a shared password, use the shared one
+				if m.tempPass == "" && sharedPass != "" {
+					m.tempPass = sharedPass
+				}
 				m.state = stateConnecting; p := m.choices[m.cursor]
-				if m.applyAll { sharedUser = m.tempUser; sharedPass = m.tempPass }
+				if m.applyAll { saveSharedCredentials(m.tempUser, m.tempPass) }
 				return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
 			} else if m.state == stateRenameImport {
 				newName := strings.TrimSpace(m.input.Value())
@@ -566,7 +790,7 @@ func (m model) View() string {
 	
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		titleStyle.Render(" RCP "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("LIGHT VPN v1.2"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.2.0"),
 	) + "\n\n"
 
 	if m.state == stateRenameImport {

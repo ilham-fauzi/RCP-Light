@@ -54,7 +54,7 @@ For users who prefer a graphical interface, RCP Light now includes a stunning **
 Full background operation via the macOS Menu Bar:
 - Centralized connection status.
 - Quick-action menu for connecting/disconnecting profiles.
-- One-click shortcuts to launch the Dashboard or Terminal UI.
+- **Intelligent Focus:** One-click shortcuts to launch the Dashboard or Terminal UI with automatic window focusing and un-minimizing.
 - **Auto-Close:** The TUI is designed to intelligently close its own window/tab upon quitting (`q`) to keep your workspace clean.
 
 ---

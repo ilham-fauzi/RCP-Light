@@ -54,6 +54,7 @@ func (d *Dashboard) Run() {
 	// Bindings
 	d.w.Bind("getVpnData", func() map[string]interface{} {
 		refreshProfiles()
+		loadSharedCredentials()
 		
 		stats := make(map[string]interface{})
 		for _, p := range profiles {
@@ -75,15 +76,18 @@ func (d *Dashboard) Run() {
 		}
 
 		return map[string]interface{}{
-			"profiles":  profiles,
-			"stats":     stats,
-			"configDir": configDir,
-			"username":  username,
+			"profiles":   profiles,
+			"stats":      stats,
+			"configDir":  configDir,
+			"username":   username,
+			"sharedUser": sharedUser,
+			"sharedPass": sharedPass,
 		}
 	})
 
-	d.w.Bind("saveUsername", func(newUsername string) {
+	d.w.Bind("saveCredentials", func(newUsername string, newPassword string) {
 		saveUsername(newUsername)
+		saveSharedCredentials(newUsername, newPassword)
 	})
 
 	d.w.Bind("exitApp", func() {
@@ -102,12 +106,7 @@ func (d *Dashboard) Run() {
 	d.w.Bind("disconnect", func(profile string) {
 		C.focus_window(d.w.Window())
 		time.Sleep(200 * time.Millisecond)
-		pidPath := filepath.Join(configDir, profile+".pid")
-		if content, err := os.ReadFile(pidPath); err == nil {
-			pid := strings.TrimSpace(string(content))
-			if pid != "" { exec.Command("sudo", "kill", pid).Run() }
-			os.Remove(pidPath)
-		}
+		disconnectVPN(profile) // stops watchdog + kills openvpn process
 	})
 
 	d.w.Bind("importProfile", func() map[string]string {
@@ -137,6 +136,7 @@ func (d *Dashboard) Run() {
 	})
 
 	d.w.SetHtml(d.getHTML())
+	C.focus_window(d.w.Window())
 	d.w.Run()
 }
 
@@ -190,11 +190,11 @@ func (d *Dashboard) getHTML() string {
 <body class="bg-surface text-on-surface font-sans min-h-screen overflow-hidden select-none">
     <div id="app">
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
-            <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT</span>
+            <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.2.0</span>
             <div class="flex gap-4 items-center">
-                <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
-                    <span class="material-symbols-outlined text-sm text-outline group-hover:text-primary transition-colors">person</span>
-                    <span id="header-username" class="text-[10px] font-mono text-outline uppercase tracking-wider group-hover:text-on-surface">---</span>
+                <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
+                    <span class="material-symbols-outlined text-[12px] text-outline group-hover:text-primary transition-colors">person</span>
+                    <span id="header-username" class="text-[10px] font-mono text-outline uppercase tracking-wider group-hover:text-on-surface leading-none">---</span>
                 </div>
                 <span onclick="refresh()" class="material-symbols-outlined text-slate-500 cursor-pointer hover:text-primary transition-colors">refresh</span>
             </div>
@@ -287,7 +287,8 @@ func (d *Dashboard) getHTML() string {
                     </label>
 
                     <button id="auth-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest shadow-lg active:scale-95 transition-all mt-2">Authorize Connection</button>
-                    <button onclick="closeModal()" class="w-full text-[10px] text-outline uppercase">Cancel</button>
+                    <div class="h-2"></div>
+                    <button onclick="closeModal()" class="w-full text-[10px] text-outline uppercase hover:text-white transition-colors py-2">Cancel</button>
                 </div>
             </div>
         </div>
@@ -310,11 +311,18 @@ func (d *Dashboard) getHTML() string {
             <div class="w-full max-w-sm mx-4 glass-panel rounded-xl overflow-hidden shadow-2xl border border-primary/20">
                 <div class="p-6 border-b border-white/5">
                     <span class="text-[10px] font-label-caps text-outline uppercase tracking-widest">Global Credentials</span>
-                    <h1 class="text-xl font-bold text-on-surface mt-1">EDIT USERNAME</h1>
+                    <h1 class="text-xl font-bold text-on-surface mt-1">EDIT CREDENTIALS</h1>
                 </div>
                 <div class="p-6 flex flex-col gap-4">
-                    <input id="new-username" type="text" class="w-full bg-white/5 border-b border-primary/30 p-2 text-xl font-bold outline-none focus:border-primary transition-all text-center">
-                    <button id="save-username-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest active:scale-95 transition-all">Update Username</button>
+                    <div class="flex flex-col gap-1">
+                        <span class="text-[9px] text-outline uppercase tracking-widest px-1">Username</span>
+                        <input id="new-username" type="text" class="w-full bg-white/5 border-b border-primary/30 p-2 text-lg font-bold outline-none focus:border-primary transition-all text-center">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <span class="text-[9px] text-outline uppercase tracking-widest px-1">Token / Password</span>
+                        <input id="new-password" type="password" placeholder="LEAVE EMPTY TO CLEAR" class="w-full bg-white/5 border-b border-primary/30 p-2 text-lg tracking-[0.3em] outline-none focus:border-primary transition-all text-center">
+                    </div>
+                    <button id="save-username-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest active:scale-95 transition-all mt-2">Update Credentials</button>
                     <button onclick="closeUsernameModal()" class="w-full text-[10px] text-outline uppercase">Cancel</button>
                 </div>
             </div>
@@ -337,6 +345,8 @@ func (d *Dashboard) getHTML() string {
                  document.getElementById('path-info').innerText = 'CONFIG_PATH: ' + data.configDir;
                  globalUsername = data.username || 'vpnuser';
                  document.getElementById('header-username').innerText = globalUsername;
+                 sharedPassword = data.sharedPass || '';
+                 sharedUsername = data.sharedUser || globalUsername;
                  
                  const profiles = data.profiles || [];
                 currentStats = data.stats || {};
@@ -473,26 +483,35 @@ func (d *Dashboard) getHTML() string {
             selectedProfile = p;
             document.getElementById('modal-profile-name').innerText = 'Profile: ' + p;
             
-            // Pre-fill with shared credentials if available, otherwise use global default
-            document.getElementById('vpn-username').value = sharedUsername || globalUsername;
-            document.getElementById('vpn-password').value = sharedPassword || '';
+            const userField = document.getElementById('vpn-username');
+            userField.value = sharedUsername || globalUsername;
             
-            // Keep checkbox checked if we have shared credentials
+            const passField = document.getElementById('vpn-password');
+            passField.value = sharedPassword || ''; // Pre-fill synced token visually
+            
             document.getElementById('apply-to-all').checked = !!sharedPassword;
-            
             document.getElementById('password-modal').classList.remove('hidden');
             
             if (document.getElementById('auth-btn').innerText !== 'AUTHORIZING...') {
                 document.getElementById('auth-error').classList.add('hidden');
             }
-            document.getElementById('vpn-password').focus();
+            
+            // Focus and select username
+            userField.focus();
+            userField.select();
         }
 
         function closeModal() { document.getElementById('password-modal').classList.add('hidden'); }
 
         document.getElementById('auth-btn').onclick = async () => {
             const user = document.getElementById('vpn-username').value.trim();
-            const pwd = document.getElementById('vpn-password').value;
+            let pwd = document.getElementById('vpn-password').value;
+            
+            // If user left password empty, use the shared one from background
+            if (!pwd && sharedPassword) {
+                pwd = sharedPassword;
+            }
+            
             if (!user || !pwd) return;
             
             if (document.getElementById('apply-to-all').checked) {
@@ -526,6 +545,7 @@ func (d *Dashboard) getHTML() string {
 
         function openUsernameModal() {
             document.getElementById('new-username').value = document.getElementById('header-username').innerText;
+            document.getElementById('new-password').value = sharedPassword;
             document.getElementById('username-modal').classList.remove('hidden');
             document.getElementById('new-username').focus();
         }
@@ -534,8 +554,9 @@ func (d *Dashboard) getHTML() string {
 
         document.getElementById('save-username-btn').onclick = async () => {
             const name = document.getElementById('new-username').value.trim();
+            const pass = document.getElementById('new-password').value;
             if (name) {
-                await saveUsername(name);
+                await saveCredentials(name, pass);
                 closeUsernameModal();
                 refresh();
             }
@@ -556,11 +577,23 @@ func (d *Dashboard) getHTML() string {
             if (e.key === 'Escape') closeUsernameModal();
         };
 
+        document.getElementById('new-password').onkeydown = (e) => {
+            if (e.key === 'Enter') document.getElementById('save-username-btn').click();
+            if (e.key === 'Escape') closeUsernameModal();
+        };
+
         window.addEventListener('keydown', (e) => {
             if (e.metaKey) {
                 const k = e.key.toLowerCase();
                 if (k === 'v') document.execCommand('paste');
                 if (k === 'c') document.execCommand('copy');
+                if (k === 'x') document.execCommand('cut');
+                if (k === 'a') {
+                    if (document.activeElement && (document.activeElement.tagName === 'INPUT')) {
+                        document.activeElement.select();
+                        e.preventDefault();
+                    }
+                }
             }
             if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); }
         });
