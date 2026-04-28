@@ -291,64 +291,80 @@ func openDashboard() {
 	exec.Command(exe, "dashboard").Start()
 }
 
+var (
+	activeLoginCmd *exec.Cmd
+	activeLoginMu  sync.Mutex
+)
+
 // openLoginWindowSubprocess launches the login window in a fresh subprocess.
 // This is required because NSWindow must be created on the main thread,
 // which is already owned by systray in the tray process.
 func openLoginWindowSubprocess(profile string) {
+	activeLoginMu.Lock()
+	defer activeLoginMu.Unlock()
+	if activeLoginCmd != nil {
+		if activeLoginCmd.Process != nil {
+			activeLoginCmd.Process.Kill()
+		}
+		activeLoginCmd = nil
+	}
+
 	exe, _ := os.Executable()
-	exec.Command(exe, "connect-ui", profile).Start()
+	cmd := exec.Command(exe, "connect-ui", profile)
+	cmd.Start()
+	activeLoginCmd = cmd
+
+	go func(c *exec.Cmd) {
+		c.Wait()
+		activeLoginMu.Lock()
+		if activeLoginCmd == c {
+			activeLoginCmd = nil
+		}
+		activeLoginMu.Unlock()
+	}(cmd)
 }
 
 func openTUI() {
 	exe, _ := os.Executable()
 	rows := 15 + len(profiles)
-	if rows < 16 {
-		rows = 16
-	}
-	if rows > 35 {
-		rows = 35
-	}
-	script := fmt.Sprintf(`
+	if rows < 16 { rows = 16 }
+	if rows > 35 { rows = 35 }
+
+	checkScript := `
 		tell application "System Events"
 			set isRunning to (count of (every process whose name is "Terminal")) > 0
 		end tell
-		tell application "Terminal"
-			activate
-			if not isRunning then
-				repeat until (count of windows) > 0
-					delay 0.1
+		if isRunning then
+			tell application "Terminal"
+				repeat with w in windows
+					try
+						if custom title of w is "RCP NETWORK" then
+							set miniaturized of w to false
+							set index of w to 1
+							tell application "System Events" to set frontmost of process "Terminal" to true
+							return "FOUND"
+						end if
+					end try
 				end repeat
-			end if
-			
-			set found to false
-			repeat with w in windows
-				try
-					if custom title of w is "RCP NETWORK" then
-						set miniaturized of w to false
-						set index of w to 1
-						set found to true
-						exit repeat
-					end if
-				end try
-			end repeat
-			
-			if found is false then
-				if not isRunning then
-					do script "printf '\\033c'; exec '%[1]s' ui" in window 1
-					set theWindow to window 1
-				else
-					set newTab to do script "printf '\\033c'; exec '%[1]s' ui"
-					set theWindow to window of newTab
-				end if
-				delay 0.5
-				set custom title of theWindow to "RCP NETWORK"
-				set number of columns of theWindow to 85
-				set number of rows of theWindow to %[2]d
-				set index of theWindow to 1
-			end if
-		end tell
-		tell application "System Events" to set frontmost of process "Terminal" to true`, exe, rows)
-	exec.Command("osascript", "-e", script).Run()
+			end tell
+		end if
+		return "NOT_FOUND"
+	`
+	out, _ := exec.Command("osascript", "-e", checkScript).Output()
+	if strings.TrimSpace(string(out)) == "FOUND" {
+		return
+	}
+
+	scriptPath := filepath.Join(os.TempDir(), "rcp_tui.command")
+	scriptContent := fmt.Sprintf(`#!/bin/bash
+printf '\033c'
+echo -ne "\033]0;RCP NETWORK\007"
+echo -ne "\033[8;%d;85t"
+"%s" ui
+osascript -e 'tell application "Terminal" to close (every window whose custom title is "RCP NETWORK") saving no' &
+`, rows, exe)
+	os.WriteFile(scriptPath, []byte(scriptContent), 0755)
+	exec.Command("open", scriptPath).Run()
 }
 
 func isProfileConnected(profile string) bool {
@@ -566,14 +582,15 @@ func disconnectVPN(profile string) {
 }
 
 func onTrayReady() {
-	systray.SetTitle("RCP")
+	systray.SetIcon(trayIconData)
+	systray.SetTitle("")
 	mItems := make(map[string]*systray.MenuItem)
 	updateTray := func() {
 		activeCount := 0
 		for _, p := range profiles {
 			if isProfileConnected(p) { activeCount++; if mItems[p] != nil { mItems[p].Check() } } else { if mItems[p] != nil { mItems[p].Uncheck() } }
 		}
-		if activeCount > 0 { systray.SetTitle(fmt.Sprintf("RCP (%d)", activeCount)) } else { systray.SetTitle("RCP") }
+		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
 	}
 	mOpenDashboard := systray.AddMenuItem("Open RCP Light Dashboard", "")
 	mOpenUI := systray.AddMenuItem("Open Terminal UI", "")

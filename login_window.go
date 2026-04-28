@@ -113,6 +113,7 @@ void login_focus(void *w) {
 */
 import "C"
 import (
+	"encoding/base64"
 	"strings"
 	"sync"
 
@@ -127,7 +128,7 @@ type loginResult struct {
 }
 
 func showLoginWindow(profile string, defaultUser string, defaultPass string) loginResult {
-	var result loginResult
+	result := loginResult{canceled: true}
 	var wg sync.WaitGroup
 	wg.Add(1)
 
@@ -135,12 +136,12 @@ func showLoginWindow(profile string, defaultUser string, defaultPass string) log
 	defer w.Destroy()
 
 	w.SetTitle("RCP Light")
-	w.SetSize(360, 350, webview.HintFixed)
+	w.SetSize(360, 420, webview.HintFixed)
 	C.login_frame(w.Window()) // frame only — before content
 	C.login_menu()            // Enable copy/paste
 
 	w.Bind("_onSubmit", func(user string, password string, applyAll bool) {
-		result = loginResult{user: user, password: password, applyAll: applyAll}
+		result = loginResult{user: user, password: password, applyAll: applyAll, canceled: false}
 		w.Terminate()
 		wg.Done()
 	})
@@ -158,9 +159,11 @@ func showLoginWindow(profile string, defaultUser string, defaultPass string) log
 }
 
 func loginHTML(profile, defaultUser string, defaultPass string) string {
+	iconBase64 := base64.StdEncoding.EncodeToString(iconData)
 	html := strings.ReplaceAll(loginTemplate, "{{PROFILE}}", profile)
 	html = strings.ReplaceAll(html, "{{DEFAULT_USER}}", defaultUser)
 	html = strings.ReplaceAll(html, "{{DEFAULT_PASS}}", defaultPass)
+	html = strings.ReplaceAll(html, "{{ICON_BASE64}}", iconBase64)
 	if defaultPass != "" {
 		html = strings.ReplaceAll(html, "id=\"a\">", "id=\"a\" checked>")
 	}
@@ -186,8 +189,8 @@ body{
   display:flex;
   flex-direction:column;
   justify-content:flex-start;
-  padding:38px 28px 20px; /* Slightly reduced top/bottom padding */
-  gap:14px; /* Reduced gap */
+  padding:24px 28px 20px;
+  gap:12px;
   -webkit-app-region:drag;
   /* Dark fallback if transparency fails */
   background: rgba(25, 25, 27, 0.85);
@@ -291,16 +294,19 @@ input[readonly]{opacity:0.6;cursor:default}
 </style>
 </head>
 <body>
+  <div class="header" style="display:flex; flex-direction:column; align-items:center; margin-bottom: -4px;">
+    <img src="data:image/png;base64,{{ICON_BASE64}}" style="width: 52px; height: 52px; filter: drop-shadow(0 0 10px rgba(95,92,241,0.5));" />
+    <h1 style="font-size: 15px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; color: white; text-shadow: 0 0 10px rgba(95,92,241,0.5); margin-top: 8px;">RCP Light</h1>
+  </div>
   <div class="chip">{{PROFILE}}</div>
 
   <div class="fields">
     <div class="field">
       <div class="label">Username</div>
-      <div class="row" style="cursor:not-allowed">
+      <div class="row">
         <span class="ico">👤</span>
         <input id="u" type="text" placeholder="Username"
                value="{{DEFAULT_USER}}" autocomplete="off" spellcheck="false"/>
-        <span class="lock-ico">🔒</span>
       </div>
     </div>
     <div class="field">
@@ -339,22 +345,7 @@ window.addEventListener('load', () => {
     // Or we can just focus password if username is readonly and filled.
     // However, the user specifically asked for focus on username column.
   }
-  // Prevent editing username but allow selection/copy
-  u.addEventListener('keydown', e => {
-    // Allow Cmd+C, Cmd+A, Tab, Arrow keys
-    if (e.metaKey || e.ctrlKey || e.key === 'Tab' || e.key.startsWith('Arrow')) return;
-    e.preventDefault();
-  });
-  u.addEventListener('paste', e => e.preventDefault());
-  u.addEventListener('cut', e => e.preventDefault());
 
-  // Ensure Cmd+A works specifically for username
-  u.addEventListener('keydown', e => {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
-      u.select();
-      e.preventDefault();
-    }
-  });
 
   [u, p].forEach(el => {
     el.addEventListener('keydown', e => {
@@ -364,20 +355,7 @@ window.addEventListener('load', () => {
   });
 });
 
-window.addEventListener('keydown', (e) => {
-  if (e.metaKey) {
-    const k = e.key.toLowerCase();
-    if (k === 'v') document.execCommand('paste');
-    if (k === 'c') document.execCommand('copy');
-    if (k === 'x') document.execCommand('cut');
-    if (k === 'a') {
-      if (document.activeElement && (document.activeElement.tagName === 'INPUT')) {
-        document.activeElement.select();
-        e.preventDefault();
-      }
-    }
-  }
-});
+
 
 function toggleEye() {
   const p = document.getElementById('p');

@@ -26,6 +26,7 @@ void make_dashboard_frameless(void *w) {
 */
 import "C"
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,6 +83,7 @@ func (d *Dashboard) Run() {
 			"username":   username,
 			"sharedUser": sharedUser,
 			"sharedPass": sharedPass,
+			"iconBase64": base64.StdEncoding.EncodeToString(iconData),
 		}
 	})
 
@@ -190,7 +192,10 @@ func (d *Dashboard) getHTML() string {
 <body class="bg-surface text-on-surface font-sans min-h-screen overflow-hidden select-none">
     <div id="app">
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
-            <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.2.0</span>
+            <div class="flex items-center gap-3">
+                <img id="app-icon" src="" class="w-8 h-8 drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] hidden" />
+                <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.2.0</span>
+            </div>
             <div class="flex gap-4 items-center">
                 <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
                     <span class="material-symbols-outlined text-[12px] text-outline group-hover:text-primary transition-colors">person</span>
@@ -347,6 +352,12 @@ func (d *Dashboard) getHTML() string {
                  document.getElementById('header-username').innerText = globalUsername;
                  sharedPassword = data.sharedPass || '';
                  sharedUsername = data.sharedUser || globalUsername;
+                 
+                 if (data.iconBase64) {
+                     const img = document.getElementById('app-icon');
+                     img.src = 'data:image/png;base64,' + data.iconBase64;
+                     img.classList.remove('hidden');
+                 }
                  
                  const profiles = data.profiles || [];
                 currentStats = data.stats || {};
