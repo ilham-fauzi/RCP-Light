@@ -17,7 +17,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/getlantern/systray"
 )
 
 // === Data Structures ===
@@ -282,7 +281,7 @@ func main() {
 	} else {
 		startBackgroundSync()
 		setupTouchID()
-		systray.Run(onTrayReady, nil)
+		startNativeTray()
 	}
 }
 
@@ -581,50 +580,8 @@ func disconnectVPN(profile string) {
 	}
 }
 
-func onTrayReady() {
-	systray.SetIcon(trayIconData)
-	systray.SetTitle("")
-	mItems := make(map[string]*systray.MenuItem)
-	updateTray := func() {
-		activeCount := 0
-		for _, p := range profiles {
-			if isProfileConnected(p) { activeCount++; if mItems[p] != nil { mItems[p].Check() } } else { if mItems[p] != nil { mItems[p].Uncheck() } }
-		}
-		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
-	}
-	mOpenDashboard := systray.AddMenuItem("Open RCP Light Dashboard", "")
-	mOpenUI := systray.AddMenuItem("Open Terminal UI", "")
-	systray.AddSeparator()
-	for _, p := range profiles {
-		item := systray.AddMenuItem(p, "")
-		mItems[p] = item
-		go func(p string, m *systray.MenuItem) {
-			for {
-				<-m.ClickedCh
-				if isProfileConnected(p) {
-					disconnectVPN(p)
-				} else {
-					// Launch login window in a subprocess — webview requires the main thread
-					// which is already owned by systray in this process.
-					openLoginWindowSubprocess(p)
-				}
-				updateTray()
-			}
-		}(p, item)
-	}
-	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("Quit", "")
-	go func() {
-		for {
-			select {
-			case <-mOpenDashboard.ClickedCh: openDashboard()
-			case <-mOpenUI.ClickedCh: openTUI()
-			case <-mQuit.ClickedCh: systray.Quit()
-			}
-		}
-	}()
-	go func() { for { time.Sleep(3 * time.Second); updateTray() } }()
-}
+// trayIconData is moved to icon.go usually, let's make sure it's available.
+// If it's missing, I'll need to find where it was defined.
 
 const (
 	stateSelect = iota

@@ -15,7 +15,7 @@ rm -f "${BINARY_NAME}"
 
 # 2. Build Go Binary
 echo "2. Building Go binary..."
-go build -o "${BINARY_NAME}" main.go dashboard.go login_window.go icon.go
+go build -o "${BINARY_NAME}" .
 if [ $? -ne 0 ]; then
     echo "❌ Error: Failed to build Go binary."
     exit 1
