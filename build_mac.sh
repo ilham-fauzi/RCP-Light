@@ -15,24 +15,45 @@ rm -f "${BINARY_NAME}"
 
 # 2. Build Go Binary
 echo "2. Building Go binary..."
-go build -o "${BINARY_NAME}" main.go dashboard.go login_window.go
+go build -o "${BINARY_NAME}" main.go dashboard.go login_window.go icon.go
 if [ $? -ne 0 ]; then
     echo "❌ Error: Failed to build Go binary."
     exit 1
 fi
 
-# 3. Create Structure
-echo "3. Creating App Bundle structure..."
+echo "3. Generating App Icon..."
+if [ -f "icon.png" ]; then
+    mkdir -p icon.iconset
+    sips -z 16 16     icon.png --out icon.iconset/icon_16x16.png &> /dev/null
+    sips -z 32 32     icon.png --out icon.iconset/icon_16x16@2x.png &> /dev/null
+    sips -z 32 32     icon.png --out icon.iconset/icon_32x32.png &> /dev/null
+    sips -z 64 64     icon.png --out icon.iconset/icon_32x32@2x.png &> /dev/null
+    sips -z 128 128   icon.png --out icon.iconset/icon_128x128.png &> /dev/null
+    sips -z 256 256   icon.png --out icon.iconset/icon_128x128@2x.png &> /dev/null
+    sips -z 256 256   icon.png --out icon.iconset/icon_256x256.png &> /dev/null
+    sips -z 512 512   icon.png --out icon.iconset/icon_256x256@2x.png &> /dev/null
+    sips -z 512 512   icon.png --out icon.iconset/icon_512x512.png &> /dev/null
+    sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png &> /dev/null
+    iconutil -c icns icon.iconset
+    rm -R icon.iconset
+else
+    echo "⚠️ icon.png not found! Skipping icon generation."
+fi
+
+# 4. Create Structure
+echo "4. Creating App Bundle structure..."
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
-# 4. Move Binary
-echo "4. Installing binary to bundle..."
+# 5. Move Binary and Icon
+echo "5. Installing binary to bundle..."
 mv "${BINARY_NAME}" "${APP_DIR}/Contents/MacOS/"
+if [ -f "icon.icns" ]; then
+    mv "icon.icns" "${APP_DIR}/Contents/Resources/"
+fi
 
-
-# 5. Info.plist
-echo "5. Creating Info.plist..."
+# 6. Info.plist
+echo "6. Creating Info.plist..."
 cat << PLIST > "${APP_DIR}/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
