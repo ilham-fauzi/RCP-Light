@@ -797,7 +797,7 @@ func (m model) View() string {
 			if isProfileConnected(p) {
 				name := truncate(p, 10); ip := getVPNIPFromLog(p)
 				scanner := getMiniScanner(m.frame + m.offsets[p], 12)
-				activeLines = append(activeLines, fmt.Sprintf("🟢 %-10s (%-15s) %s", name, ip, scanner))
+				activeLines = append(activeLines, fmt.Sprintf("⚡ %-10s (%-15s) %s", name, ip, scanner))
 			}
 		}
 		if len(activeLines) == 0 { return miniBoxStyle.Render("RCP: No Active VPN") + "\n" }
@@ -824,7 +824,7 @@ func (m model) View() string {
 				statusIcon := "  "; ipInfo := ""; scanner := ""; speedInfo := ""; name := truncate(p, 10)
 				connected := isProfileConnected(p)
 				if connected {
-					if m.pulseState { statusIcon = "🟢" } else { statusIcon = "🔵" }
+					statusIcon = "⚡"
 					ip := getVPNIPFromLog(p); if ip != "" { ipInfo = " (" + ip + ")" }
 					scanner = getMiniScanner(m.frame + m.offsets[p], 12)
 					if s, ok := globalNetStats[p]; ok {
