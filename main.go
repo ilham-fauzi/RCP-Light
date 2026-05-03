@@ -31,6 +31,12 @@ type NetStats struct {
 	LastCheck time.Time
 }
 
+type AuditEntry struct {
+	Timestamp time.Time `json:"timestamp"`
+	Message   string    `json:"message"`
+	Type      string    `json:"type"` // info, success, warning
+}
+
 // === Global Variables ===
 
 // credStore holds credentials for auto-reconnect watchdog
@@ -53,6 +59,15 @@ var (
 	activeConnections   = make(map[string]vpnCred)
 	activeConnMu        sync.Mutex
 
+	// globalLatencies stores current latency in ms for each active profile
+	globalLatencies     = make(map[string]float64)
+	globalLatenciesMu   sync.Mutex
+
+	// Smart Orchestrator state for anti-flapping
+	lastWinner         string
+	lastWinnerLatency  float64
+	orchestratorMu     sync.Mutex
+
 	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#5F5CF1")).Padding(0, 1).Bold(true)
 	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
 	itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
@@ -72,6 +87,9 @@ var (
 
 	sharedUser string
 	sharedPass string
+
+	auditLogs []AuditEntry
+	auditMu   sync.Mutex
 )
 
 // === Logic Functions ===
@@ -89,8 +107,20 @@ func initConfig() {
 
 func saveUsername(newUsername string) {
 	username = strings.TrimSpace(newUsername)
-	credPath := filepath.Join(configDir, "username.cred")
-	os.WriteFile(credPath, []byte(username), 0644)
+	os.WriteFile(filepath.Join(configDir, "username.cred"), []byte(username), 0644)
+}
+
+func addAuditLog(msg string, entryType string) {
+	auditMu.Lock()
+	defer auditMu.Unlock()
+	auditLogs = append(auditLogs, AuditEntry{
+		Timestamp: time.Now(),
+		Message:   msg,
+		Type:      entryType,
+	})
+	if len(auditLogs) > 50 {
+		auditLogs = auditLogs[len(auditLogs)-50:]
+	}
 }
 
 func loadSharedCredentials() {
@@ -148,6 +178,7 @@ func startBackgroundSync() {
 	go func() {
 		for { updateAllStats(); time.Sleep(1 * time.Second) }
 	}()
+	go startSmartOrchestrator()
 }
 
 func checkEngine() {
@@ -434,6 +465,139 @@ func updateNetStats(s *NetStats) {
 	s.LastIn, s.LastOut, s.LastCheck = ibytes, obytes, now
 }
 
+func measureLatency(profile string) float64 {
+	ip := getVPNIPFromLog(profile)
+	if ip == "" { return 9999 }
+	iface := findInterfaceByIP(ip)
+	if iface == "" { return 9999 }
+
+	targets := []string{"1.1.1.1", "8.8.8.8"}
+	var bestLat float64 = 9999
+
+	for _, target := range targets {
+		// Ping through specific interface
+		cmd := exec.Command("ping", "-c", "1", "-W", "800", "-S", ip, target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		out, err := cmd.Output()
+		if err != nil { continue }
+
+		re := regexp.MustCompile(`time=([\d.]+) ms`)
+		match := re.FindStringSubmatch(string(out))
+		if len(match) > 1 {
+			l, _ := strconv.ParseFloat(match[1], 64)
+			if l < bestLat { bestLat = l }
+		}
+	}
+	return bestLat
+}
+
+func flushDNS() {
+	// macOS DNS Flush
+	exec.Command("sudo", "dscacheutil", "-flushcache").Run()
+	exec.Command("sudo", "killall", "-HUP", "mDNSResponder").Run()
+}
+
+func triggerReoptimization() {
+	go func() {
+		orchestrateOnce()
+		flushDNS()
+	}()
+}
+
+func orchestrateOnce() {
+	refreshProfiles()
+	var active []string
+	for _, p := range profiles {
+		if isProfileConnected(p) { active = append(active, p) }
+	}
+
+	if len(active) == 0 { return }
+
+	results := make(map[string]float64)
+	var bestProfile string
+	minLatency := 9999.0
+
+	for _, p := range active {
+		lat := measureLatency(p)
+		results[p] = lat
+		if lat < minLatency {
+			minLatency = lat
+			bestProfile = p
+		}
+	}
+
+	globalLatenciesMu.Lock()
+	globalLatencies = results
+	globalLatenciesMu.Unlock()
+
+	if bestProfile == "" || minLatency >= 9999 { return }
+
+	orchestratorMu.Lock()
+	defer orchestratorMu.Unlock()
+
+	// Anti-flapping logic: 
+	// Only switch if the new path is significantly better (15% threshold)
+	// or if the current winner is no longer available/stable.
+	shouldSwitch := false
+	if lastWinner == "" || lastWinner != bestProfile {
+		if lastWinner == "" {
+			shouldSwitch = true
+		} else {
+			currentWinnerLat := results[lastWinner]
+			// Switch if current winner is dead or new winner is 15% better
+			if currentWinnerLat >= 9999 || minLatency < (currentWinnerLat * 0.85) {
+				shouldSwitch = true
+			}
+		}
+	}
+
+	if shouldSwitch {
+		oldWinner := lastWinner
+		applySmartRouting(active, bestProfile)
+		lastWinner = bestProfile
+		lastWinnerLatency = minLatency
+		flushDNS()
+
+		if oldWinner == "" {
+			addAuditLog(fmt.Sprintf("Primary route established: %s (%.1fms)", bestProfile, minLatency), "success")
+		} else {
+			addAuditLog(fmt.Sprintf("Optimized: %s -> %s (%.1fms vs %.1fms)", oldWinner, bestProfile, minLatency, results[oldWinner]), "success")
+		}
+	}
+}
+
+func startSmartOrchestrator() {
+	time.Sleep(5 * time.Second)
+	for {
+		orchestrateOnce()
+		
+		// Adjust sleep based on activity
+		sleepTime := 30 * time.Second
+		activeCount := 0
+		for _, p := range profiles { if isProfileConnected(p) { activeCount++ } }
+		if activeCount > 1 { sleepTime = 10 * time.Second }
+		
+		time.Sleep(sleepTime)
+	}
+}
+
+func applySmartRouting(profiles []string, winner string) {
+	// Winner gets metric 50 (highest priority), others get 100, 110, 120...
+	for i, p := range profiles {
+		metric := 100 + (i * 10)
+		if p == winner { metric = 50 }
+		
+		ip := getVPNIPFromLog(p)
+		iface := findInterfaceByIP(ip)
+		if iface == "" { continue }
+
+		// On macOS, we use 'route add default -ifscope <iface> -metric <M>'
+		// However, it's safer to just set the metric for the specific interface
+		// We'll use 'sudo route change default -ifscope <iface> -metric <metric>'
+		exec.Command("sudo", "route", "change", "default", "-ifscope", iface, "-metric", strconv.Itoa(metric)).Run()
+	}
+}
+
 func connectVPN(profile string, user string, password string) error {
 	ovpnFile := profileMap[profile]
 	ovpnPath := filepath.Join(configDir, ovpnFile)
@@ -508,7 +672,7 @@ func vpnWatchdog(profile string) {
 	time.Sleep(10 * time.Second)
 	for {
 		activeConnMu.Lock()
-		cred, shouldWatch := activeConnections[profile]
+		_, shouldWatch := activeConnections[profile]
 		activeConnMu.Unlock()
 
 		if !shouldWatch {
@@ -516,21 +680,31 @@ func vpnWatchdog(profile string) {
 			return
 		}
 
-		if !isProfileConnected(profile) {
+		if !isProfileConnected(profile) || measureLatency(profile) > 5000 {
+			// Connection dropped OR tunnel is unresponsive (latency > 5s or RTO)
 			// Connection dropped unexpectedly — attempt reconnect
 			// Brief wait to let network settle (e.g. after wake from sleep)
 			time.Sleep(5 * time.Second)
 
 			activeConnMu.Lock()
-			_, stillActive := activeConnections[profile]
+			cred, stillActive := activeConnections[profile]
 			activeConnMu.Unlock()
 			if !stillActive { return }
+
+			// If it was a false connection (process alive but tunnel dead), kill it first
+			if isProfileConnected(profile) {
+				disconnectVPN(profile)
+				time.Sleep(1 * time.Second)
+				activeConnMu.Lock()
+				activeConnections[profile] = cred // restore cred after disconnectVPN deleted it
+				activeConnMu.Unlock()
+			}
 
 			// Try to reconnect (ignore errors — watchdog will retry next cycle)
 			_ = connectVPNDirect(profile, cred.user, cred.pass)
 		}
 
-		time.Sleep(15 * time.Second)
+		time.Sleep(30 * time.Second)
 	}
 }
 
@@ -585,35 +759,66 @@ func onTrayReady() {
 	systray.SetIcon(trayIconData)
 	systray.SetTitle("")
 	mItems := make(map[string]*systray.MenuItem)
-	updateTray := func() {
-		activeCount := 0
-		for _, p := range profiles {
-			if isProfileConnected(p) { activeCount++; if mItems[p] != nil { mItems[p].Check() } } else { if mItems[p] != nil { mItems[p].Uncheck() } }
-		}
-		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
-	}
 	mOpenDashboard := systray.AddMenuItem("Open RCP Light Dashboard", "")
 	mOpenUI := systray.AddMenuItem("Open Terminal UI", "")
 	systray.AddSeparator()
 	for _, p := range profiles {
-		item := systray.AddMenuItem(p, "")
-		mItems[p] = item
+		mItems[p] = systray.AddMenuItem(p, "")
+	}
+	systray.AddSeparator()
+	mLastEvent := systray.AddMenuItem("Ready", "")
+	mLastEvent.Disable()
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Quit", "")
+
+	updateTray := func() {
+		activeCount := 0
+		for _, p := range profiles {
+			connected := isProfileConnected(p)
+			title := p
+			if connected {
+				activeCount++
+				mItems[p].Check()
+				
+				orchestratorMu.Lock()
+				isPrimary := (p == lastWinner)
+				orchestratorMu.Unlock()
+				
+				isMoving := false
+				if s, ok := globalNetStats[p]; ok {
+					if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true }
+				}
+				
+				if isPrimary { title += " [PRIMARY]" }
+				if isMoving { title += " [TRANS]" }
+			} else {
+				mItems[p].Uncheck()
+			}
+			mItems[p].SetTitle(title)
+		}
+
+		auditMu.Lock()
+		if len(auditLogs) > 0 {
+			mLastEvent.SetTitle("Event: " + auditLogs[len(auditLogs)-1].Message)
+		}
+		auditMu.Unlock()
+
+		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
+	}
+	for _, p := range profiles {
 		go func(p string, m *systray.MenuItem) {
 			for {
 				<-m.ClickedCh
 				if isProfileConnected(p) {
 					disconnectVPN(p)
 				} else {
-					// Launch login window in a subprocess — webview requires the main thread
-					// which is already owned by systray in this process.
 					openLoginWindowSubprocess(p)
 				}
 				updateTray()
 			}
-		}(p, item)
+		}(p, mItems[p])
 	}
-	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("Quit", "")
+
 	go func() {
 		for {
 			select {
@@ -828,7 +1033,13 @@ func (m model) View() string {
 					ip := getVPNIPFromLog(p); if ip != "" { ipInfo = " (" + ip + ")" }
 					scanner = getMiniScanner(m.frame + m.offsets[p], 12)
 					if s, ok := globalNetStats[p]; ok {
-						speedInfo = fmt.Sprintf(" %s %s %s %s", downStyle.Render("↓"), formatSpeed(s.InSpeed), upStyle.Render("↑"), formatSpeed(s.OutSpeed))
+						primaryStr := ""
+						orchestratorMu.Lock()
+						if p == lastWinner && connected { primaryStr = " [PRIMARY]" }
+						orchestratorMu.Unlock()
+						activityStr := ""
+						if s.InSpeed > 1024 || s.OutSpeed > 512 { activityStr = " [TRANS]" }
+						speedInfo = fmt.Sprintf(" %s %s %s %s %s %s", downStyle.Render("↓"), formatSpeed(s.InSpeed), upStyle.Render("↑"), formatSpeed(s.OutSpeed), primaryStr, activityStr)
 					}
 				}
 				prefix := "  "; if m.cursor == i { prefix = "> " }
@@ -853,6 +1064,12 @@ func (m model) View() string {
 		} else { statusText = fmt.Sprintf("Active: %d profiles", activeCount) }
 		if m.state == stateError { body += "\n\n" + errorStyle.Render(statusText)
 		} else { body += "\n\n" + statusStyle.Render(statusText) }
+
+		auditMu.Lock()
+		if len(auditLogs) > 0 {
+			body += "\n" + dimStyle.Render("  "+auditLogs[len(auditLogs)-1].Message)
+		}
+		auditMu.Unlock()
 	} else if m.state == stateConnecting {
 		body = fmt.Sprintf("Connecting to %s...\n\nVerifying connection...", m.choices[m.cursor])
 	} else if m.state == stateUsername {

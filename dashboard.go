@@ -68,15 +68,33 @@ func (d *Dashboard) Run() {
 					up = formatSpeed(s.OutSpeed)
 				}
 			}
+			var lat float64
+			globalLatenciesMu.Lock()
+			lat = globalLatencies[p]
+			globalLatenciesMu.Unlock()
+
+			isPrimary := false
+			orchestratorMu.Lock()
+			if p == lastWinner { isPrimary = true }
+			orchestratorMu.Unlock()
+
+			isMoving := false
+			if s, ok := globalNetStats[p]; ok {
+				if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true }
+			}
+
 			stats[p] = map[string]interface{}{
-				"connected": connected,
-				"ip":        ip,
-				"down":      down,
-				"up":        up,
+				"connected":  connected,
+				"ip":         ip,
+				"down":       down,
+				"up":         up,
+				"latency":    lat,
+				"isPrimary":  isPrimary,
+				"isMoving":   isMoving,
 			}
 		}
 
-		return map[string]interface{}{
+		res := map[string]interface{}{
 			"profiles":   profiles,
 			"stats":      stats,
 			"configDir":  configDir,
@@ -85,6 +103,14 @@ func (d *Dashboard) Run() {
 			"sharedPass": sharedPass,
 			"iconBase64": base64.StdEncoding.EncodeToString(iconData),
 		}
+		
+		auditMu.Lock()
+		logs := make([]AuditEntry, len(auditLogs))
+		copy(logs, auditLogs)
+		auditMu.Unlock()
+		
+		res["auditLogs"] = logs
+		return res
 	})
 
 	d.w.Bind("saveCredentials", func(newUsername string, newPassword string) {
@@ -137,6 +163,10 @@ func (d *Dashboard) Run() {
 		refreshProfiles()
 	})
 
+	d.w.Bind("triggerOptimize", func() {
+		triggerReoptimization()
+	})
+
 	d.w.SetHtml(d.getHTML())
 	C.focus_window(d.w.Window())
 	d.w.Run()
@@ -187,6 +217,16 @@ func (d *Dashboard) getHTML() string {
         #apply-to-all:checked + div .checked-icon { opacity: 1; }
         #apply-to-all:checked + div { border-color: #5F5CF1; background: rgba(95, 92, 241, 0.1); }
         button:disabled { opacity: 0.5; cursor: not-allowed; filter: grayscale(1); }
+        
+        .wave-animation { display: flex; align-items: flex-end; gap: 2px; height: 12px; }
+        .wave-bar { width: 2px; background: #00FF88; border-radius: 1px; animation: wave 1s infinite ease-in-out; }
+        .wave-bar:nth-child(2) { animation-delay: 0.2s; }
+        .wave-bar:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes wave { 0%, 100% { height: 4px; } 50% { height: 12px; } }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(95,92,241,0.2); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(95,92,241,0.4); }
     </style>
 </head>
 <body class="bg-surface text-on-surface font-sans min-h-screen overflow-hidden select-none">
@@ -200,6 +240,10 @@ func (d *Dashboard) getHTML() string {
                 <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
                     <span class="material-symbols-outlined text-[12px] text-outline group-hover:text-primary transition-colors">person</span>
                     <span id="header-username" class="text-[10px] font-mono text-outline uppercase tracking-wider group-hover:text-on-surface leading-none">---</span>
+                </div>
+                <div id="optimize-btn" onclick="manualOptimize()" class="flex items-center gap-2 px-3 py-1.5 bg-primary/10 rounded-full border border-primary/20 hover:border-primary/50 cursor-pointer transition-all group">
+                    <span id="optimize-icon" class="material-symbols-outlined text-[14px] text-primary transition-all">bolt</span>
+                    <span class="text-[10px] font-bold text-primary uppercase tracking-widest leading-none">OPTIMIZE</span>
                 </div>
                 <span onclick="refresh()" class="material-symbols-outlined text-slate-500 cursor-pointer hover:text-primary transition-colors">refresh</span>
             </div>
@@ -241,6 +285,16 @@ func (d *Dashboard) getHTML() string {
                             <p class="text-[9px] font-label-caps text-outline uppercase">Upload</p>
                             <p id="stat-up" class="font-mono text-sm">0 B/s</p>
                         </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-4 flex flex-col gap-3 flex-1 min-h-0">
+                    <h3 class="text-[10px] font-bold text-outline opacity-50 uppercase tracking-widest flex items-center gap-2">
+                        <span class="material-symbols-outlined text-[14px]">history</span>
+                        Network Events
+                    </h3>
+                    <div id="audit-log" class="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar text-[10px]">
+                        <!-- Logs here -->
                     </div>
                 </div>
             </div>
@@ -341,6 +395,7 @@ func (d *Dashboard) getHTML() string {
         let sharedPassword = '';
         let sharedUsername = '';
         let globalUsername = '';
+        let bestProfile = '';
 
         async function refresh() {
             try {
@@ -382,9 +437,38 @@ func (d *Dashboard) getHTML() string {
                     systemStatus.innerText = 'OFFLINE';
                     systemStatus.classList.remove('text-secondary');
                     systemStatus.classList.add('text-outline');
-                    document.getElementById('stat-down').innerText = '0 B/s';
-                    document.getElementById('stat-up').innerText = '0 B/s';
+                    document.getElementById('stat-down').textContent = totalDown;
+                    document.getElementById('stat-up').textContent = totalUp;
                 }
+
+                // Update Audit Logs
+                const logContainer = document.getElementById('audit-log');
+                if (data.auditLogs && data.auditLogs.length > 0) {
+                    const logHtml = data.auditLogs.slice().reverse().map(entry => {
+                        const time = new Date(entry.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        let colorClass = 'text-outline';
+                        if (entry.type === 'success') colorClass = 'text-secondary';
+                        if (entry.type === 'warning') colorClass = 'text-orange-400';
+                        return '<div class="flex gap-2 border-b border-white/5 pb-2 last:border-0">' +
+                                '<span class="opacity-30 shrink-0">' + time + '</span>' +
+                                '<span class="' + colorClass + '">' + entry.message + '</span>' +
+                            '</div>';
+                    }).join('');
+                    logContainer.innerHTML = logHtml;
+                } else {
+                    logContainer.innerHTML = '<div class="opacity-20 italic">No events recorded yet</div>';
+                }
+
+                // Find best profile
+                let minLat = 9998;
+                bestProfile = '';
+                profiles.forEach(p => {
+                    const s = currentStats[p] || {};
+                    if (s.connected && s.latency > 0 && s.latency < minLat) {
+                        minLat = s.latency;
+                        bestProfile = p;
+                    }
+                });
 
                 // 2. PROFILE LIST & SELECTION STATUS
                 profiles.forEach(p => {
@@ -422,11 +506,24 @@ func (d *Dashboard) getHTML() string {
                     const activeClass = s.connected ? 'active-glow border-secondary/30 bg-secondary/5' : (isSelected ? 'bg-primary/20 border-primary/40' : 'hover:bg-white/5');
                     const statusDot = s.connected ? '<span class="w-2 h-2 rounded-full bg-secondary pulse-dot"></span>' : '<span class="w-2 h-2 rounded-full bg-outline/20"></span>';
                     
+                    let latBadge = '';
+                    if (s.connected) {
+                        const latColor = s.latency < 100 ? 'text-secondary' : (s.latency < 300 ? 'text-yellow-500' : 'text-red-500');
+                        const isBest = s.isPrimary ? '<span class="bg-secondary/20 text-secondary text-[8px] px-1.5 py-0.5 rounded ml-2 border border-secondary/30 font-bold tracking-tight">PRIMARY ROUTE</span>' : '';
+                        
+                        let activity = '';
+                        if (s.isMoving) {
+                            activity = '<div class="wave-animation ml-3"><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><span class="text-[8px] text-secondary font-bold ml-1 uppercase">DATA FLOWING</span></div>';
+                        }
+                        
+                        latBadge = '<span class="' + latColor + ' font-mono text-[10px] ml-3">' + Math.round(s.latency) + 'ms</span>' + isBest + activity;
+                    }
+
                     html += '<div onclick="selectProfile(\'' + p + '\')" ondblclick="handleAction(\'' + p + '\', ' + s.connected + ')" class="glass-panel rounded-xl p-4 flex items-center justify-between transition-all cursor-pointer border ' + activeClass + '">' +
                             '<div class="flex items-center gap-4">' +
                                 '<span class="material-symbols-outlined ' + (s.connected ? 'text-secondary' : (isSelected ? 'text-primary' : 'text-outline')) + '">' + (s.connected ? 'shield' : 'dns') + '</span>' +
                                 '<div>' +
-                                    '<span class="font-bold ' + (s.connected ? 'text-secondary' : 'text-on-surface') + '">' + p + '</span>' +
+                                    '<div class="flex items-center"><span class="font-bold ' + (s.connected ? 'text-secondary' : 'text-on-surface') + '">' + p + '</span>' + latBadge + '</div>' +
                                     '<div class="flex items-center gap-2">' + statusDot + '<span class="text-[10px] uppercase text-outline">' + (s.connected ? 'Connected' : 'Disconnected') + '</span></div>' +
                                 '</div>' +
                             '</div>' +
@@ -608,6 +705,16 @@ func (d *Dashboard) getHTML() string {
             }
             if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); }
         });
+
+        async function manualOptimize() {
+            const icon = document.getElementById('optimize-icon');
+            icon.classList.add('animate-spin');
+            await triggerOptimize();
+            setTimeout(() => {
+                icon.classList.remove('animate-spin');
+                refresh();
+            }, 1500);
+        }
 
         setInterval(refresh, 1000);
         refresh();
