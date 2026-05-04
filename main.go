@@ -13,6 +13,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"net"
+	"net/http"
+	"crypto/tls"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -37,6 +40,12 @@ type AuditEntry struct {
 	Type      string    `json:"type"` // info, success, warning
 }
 
+type HostRouteEntry struct {
+	IP        string    `json:"ip"`
+	Profile   string    `json:"profile"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // === Global Variables ===
 
 // credStore holds credentials for auto-reconnect watchdog
@@ -54,6 +63,7 @@ var (
 	miniMode   bool
 
 	globalNetStats = make(map[string]*NetStats)
+	vpnStateMu     sync.Mutex
 
 	// activeConnections tracks profiles that should remain connected (for auto-reconnect)
 	activeConnections   = make(map[string]vpnCred)
@@ -62,6 +72,10 @@ var (
 	// globalLatencies stores current latency in ms for each active profile
 	globalLatencies     = make(map[string]float64)
 	globalLatenciesMu   sync.Mutex
+
+	// currentActiveInterface is the interface currently handling global traffic
+	currentActiveInterface string
+	currentActiveIfaceMu   sync.Mutex
 
 	// Smart Orchestrator state for anti-flapping
 	lastWinner         string
@@ -90,6 +104,9 @@ var (
 
 	auditLogs []AuditEntry
 	auditMu   sync.Mutex
+
+	hostRouteCache   = make(map[string]HostRouteEntry) // Domain/IP -> Entry
+	hostRouteCacheMu sync.Mutex
 )
 
 // === Logic Functions ===
@@ -143,6 +160,9 @@ func saveSharedCredentials(u, p string) {
 }
 
 func refreshProfiles() {
+	vpnStateMu.Lock()
+	defer vpnStateMu.Unlock()
+	
 	profileMap = make(map[string]string)
 	entries, err := os.ReadDir(configDir)
 	if err != nil {
@@ -164,6 +184,9 @@ func refreshProfiles() {
 
 func updateAllStats() {
 	refreshProfiles()
+	vpnStateMu.Lock()
+	defer vpnStateMu.Unlock()
+	
 	for _, p := range profiles {
 		if isProfileConnected(p) {
 			ip := getVPNIPFromLog(p)
@@ -497,6 +520,160 @@ func flushDNS() {
 	exec.Command("sudo", "killall", "-HUP", "mDNSResponder").Run()
 }
 
+func getActualActiveInterface() string {
+	// We check who handles traffic to a common internet IP
+	cmd := exec.Command("route", "get", "1.1.1.1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, err := cmd.Output()
+	if err != nil { return "" }
+	
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "interface:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[1]
+			}
+		}
+	}
+	return ""
+}
+
+func probeHostThroughProfile(profile string, targetIP string) (float64, error) {
+	ip := getVPNIPFromLog(profile)
+	if ip == "" { return 0, fmt.Errorf("no VPN IP") }
+	
+	start := time.Now()
+	
+	// Use TCP Dialing instead of just Ping for better accuracy with web services
+	// We force the dial through the specific VPN local IP
+	localAddr, _ := net.ResolveTCPAddr("tcp", ip+":0")
+	dialer := net.Dialer{
+		LocalAddr: localAddr,
+		Timeout:   1500 * time.Millisecond,
+	}
+	
+	conn, err := dialer.Dial("tcp", targetIP+":443")
+	if err == nil {
+		conn.Close()
+		return float64(time.Since(start).Milliseconds()), nil
+	}
+	
+	// Fallback to port 80
+	conn, err = dialer.Dial("tcp", targetIP+":80")
+	if err == nil {
+		conn.Close()
+		return float64(time.Since(start).Milliseconds()), nil
+	}
+
+	// Final fallback to Ping if TCP fails (some internal resources might only respond to ICMP)
+	cmd := exec.Command("ping", "-c", "1", "-W", "1000", "-S", ip, targetIP)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	err = cmd.Run()
+	if err == nil {
+		lat := float64(time.Since(start).Milliseconds())
+		return lat, nil
+	}
+
+	fmt.Printf("   [DEBUG] %-10s -> %s: UNREACHABLE (TCP & Ping Failed)\n", profile, targetIP)
+	return 0, fmt.Errorf("unreachable")
+}
+
+func probeHostHTTPStatus(profile string, targetIP string) (int, error) {
+	ip := getVPNIPFromLog(profile)
+	if ip == "" { return 0, fmt.Errorf("no VPN IP") }
+
+	localAddr, _ := net.ResolveTCPAddr("tcp", ip+":0")
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			LocalAddr: localAddr,
+			Timeout:   2500 * time.Millisecond,
+		}).DialContext,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   3000 * time.Millisecond,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Try to get hostname from system DNS cache for better accuracy
+	hostname := ""
+	out, err := exec.Command("dscacheutil", "-q", "host", "-a", "ip", targetIP).Output()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), "name:") {
+				hostname = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "name:"))
+				break
+			}
+		}
+	}
+	
+	// Fallback to Reverse DNS
+	if hostname == "" {
+		names, _ := net.LookupAddr(targetIP)
+		if len(names) > 0 {
+			hostname = strings.TrimSuffix(names[0], ".")
+		}
+	}
+
+	doGet := func(proto string) (int, error) {
+		req, _ := http.NewRequest("GET", proto+"://"+targetIP, nil)
+		if hostname != "" {
+			req.Host = hostname
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			return resp.StatusCode, nil
+		}
+		return 0, err
+	}
+
+	// Try HTTPS first
+	status, err := doGet("https")
+	if err == nil {
+		fmt.Printf("   [HTTP] %-10s -> %s (%s): Status %d\n", profile, targetIP, hostname, status)
+		return status, nil
+	}
+	
+	// Fallback to HTTP
+	status, err = doGet("http")
+	if err == nil {
+		fmt.Printf("   [HTTP] %-10s -> %s (%s): Status %d\n", profile, targetIP, hostname, status)
+		return status, nil
+	}
+
+	fmt.Printf("   [HTTP] %-10s -> %s (%s): FAILED (%v)\n", profile, targetIP, hostname, err)
+	return 0, err
+}
+
+func applyHostRoute(targetIP string, profile string) error {
+	ip := getVPNIPFromLog(profile)
+	iface := findInterfaceByIP(ip)
+	if iface == "" { return fmt.Errorf("interface not found") }
+
+	// Removed the direct log here to avoid premature logging before confirmation
+
+	// First, remove existing route to avoid "File exists"
+	exec.Command("sudo", "route", "delete", "-host", targetIP).Run()
+	
+	// Add the new specific route
+	cmd := exec.Command("sudo", "route", "add", "-host", targetIP, "-interface", iface)
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to add route: %v", err)
+	}
+
+	// Force flush socket states for this IP to kill "stuck" browser connections
+	exec.Command("sudo", "pfctl", "-k", targetIP).Run()
+
+	return nil
+}
+
 func triggerReoptimization() {
 	go func() {
 		orchestrateOnce()
@@ -564,9 +741,171 @@ func orchestrateOnce() {
 			addAuditLog(fmt.Sprintf("Optimized: %s -> %s (%.1fms vs %.1fms)", oldWinner, bestProfile, minLatency, results[oldWinner]), "success")
 		}
 	}
+
+	// Update current active interface for UI indicators
+	actual := getActualActiveInterface()
+	currentActiveIfaceMu.Lock()
+	currentActiveInterface = actual
+	currentActiveIfaceMu.Unlock()
+	
+	// Check for mismatch
+	if lastWinner != "" {
+		ip := getVPNIPFromLog(lastWinner)
+		winnerIface := findInterfaceByIP(ip)
+		if actual != "" && winnerIface != "" && actual != winnerIface {
+			addAuditLog(fmt.Sprintf("Routing Mismatch: System using %s instead of %s", actual, winnerIface), "warning")
+		}
+	}
+
+	// === DYNAMIC TRAFFIC MONITORING ===
+	// Already started in startSmartOrchestrator or main
+
+	// Cache Cleanup: Remove entries if the profile is no longer active
+	hostRouteCacheMu.Lock()
+	defer hostRouteCacheMu.Unlock()
+	for host, entry := range hostRouteCache {
+		if !isProfileConnected(entry.Profile) {
+			delete(hostRouteCache, host)
+			// Also clean up the system route
+			exec.Command("sudo", "route", "delete", "-host", entry.IP).Run()
+			addAuditLog(fmt.Sprintf("Cache Cleaned: Removed route for %s (Profile %s disconnected)", host, entry.Profile), "info")
+		}
+	}
+}
+
+func monitorAndProbeTraffic() {
+	// Scan active connections using netstat
+	out, err := exec.Command("netstat", "-n", "-f", "inet").Output()
+	if err != nil { return }
+
+	// Refresh profiles once before the loop
+	refreshProfiles()
+	
+	vpnStateMu.Lock()
+	activeVPNs := []string{}
+	for _, p := range profiles {
+		if isProfileConnected(p) {
+			activeVPNs = append(activeVPNs, p)
+		}
+	}
+	vpnStateMu.Unlock()
+
+	if len(activeVPNs) < 2 { return }
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "ESTABLISHED") { continue }
+		
+		fields := strings.Fields(line)
+		if len(fields) < 5 { continue }
+		
+		foreignAddr := fields[4] // Destination IP.Port
+		parts := strings.Split(foreignAddr, ".")
+
+		// FILTER: Only concern with Browser Traffic (Port 80 and 443)
+		isBrowser := strings.HasSuffix(foreignAddr, ".443") || strings.HasSuffix(foreignAddr, ".80") || 
+					 strings.HasSuffix(foreignAddr, ":443") || strings.HasSuffix(foreignAddr, ":80")
+		
+		if !isBrowser { continue }
+
+		targetIP := ""
+		if len(parts) >= 4 {
+			if strings.Contains(foreignAddr, ":") {
+				targetIP = strings.Split(foreignAddr, ":")[0]
+			} else {
+				targetIP = strings.Join(parts[0:4], ".")
+			}
+		}
+		
+		if targetIP == "" { continue }
+		
+		if strings.HasPrefix(targetIP, "127.") || strings.HasPrefix(targetIP, "192.168.") || strings.HasPrefix(targetIP, "0.") {
+			continue
+		}
+
+		hostRouteCacheMu.Lock()
+		_, exists := hostRouteCache[targetIP]
+		hostRouteCacheMu.Unlock()
+
+		if !exists {
+			// Quietly probe in the background
+			go func(ip string, active []string) {
+				type resEntry struct {
+					profile string
+					latency float64
+					status  int
+				}
+				var results []resEntry
+				
+				// SEQUENTIAL ISOLATED PROBING
+				// We test each profile one by one, giving it a temporary /32 route
+				// to ensure the probe traffic ONLY goes through that specific tunnel.
+				for _, p := range active {
+					ipAddr := getVPNIPFromLog(p)
+					iface := findInterfaceByIP(ipAddr)
+					if iface == "" { continue }
+
+					// 1. Add temporary route for this probe
+					exec.Command("sudo", "route", "delete", "-host", ip).Run()
+					exec.Command("sudo", "route", "add", "-host", ip, "-interface", iface).Run()
+					
+					// 2. Perform isolated probe
+					lat, err := probeHostThroughProfile(p, ip)
+					status := 0
+					if err == nil {
+						status, _ = probeHostHTTPStatus(p, ip)
+					}
+					results = append(results, resEntry{p, lat, status})
+
+					// 3. Cleanup temporary route
+					exec.Command("sudo", "route", "delete", "-host", ip).Run()
+				}
+
+				bestLat := 9999.0
+				bestProfile := ""
+				
+				// Priority 1: Profiles that give TRUE Success (2xx or 3xx status)
+				for _, r := range results {
+					if r.status >= 200 && r.status < 400 {
+						if r.latency < bestLat {
+							bestLat = r.latency
+							bestProfile = r.profile
+						}
+					}
+				}
+
+				// STRICT: No fallback to 404/403. 
+				// If no success found, cache as "negative" to stop flooding
+				if bestProfile == "" {
+					hostRouteCacheMu.Lock()
+					hostRouteCache[ip] = HostRouteEntry{IP: ip, Profile: "NONE", Timestamp: time.Now()}
+					hostRouteCacheMu.Unlock()
+					return 
+				}
+
+				if bestProfile != "" {
+					fmt.Printf("\033[32m[ASSIGN] Routing %s to %s\033[0m\n", ip, bestProfile)
+					applyHostRoute(ip, bestProfile)
+					hostRouteCacheMu.Lock()
+					hostRouteCache[ip] = HostRouteEntry{IP: ip, Profile: bestProfile, Timestamp: time.Now()}
+					hostRouteCacheMu.Unlock()
+					addAuditLog(fmt.Sprintf("Auto-Discovered: %s -> %s", ip, bestProfile), "success")
+					fmt.Printf("\033[32m[SMART-ROUTE] %s is now handled by %s (%.1fms)\033[0m\n", ip, bestProfile, bestLat)
+				}
+			}(targetIP, activeVPNs)
+		}
+	}
 }
 
 func startSmartOrchestrator() {
+	// Start background traffic monitoring
+	go func() {
+		for {
+			monitorAndProbeTraffic()
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
 	time.Sleep(5 * time.Second)
 	for {
 		orchestrateOnce()
@@ -582,20 +921,35 @@ func startSmartOrchestrator() {
 }
 
 func applySmartRouting(profiles []string, winner string) {
-	// Winner gets metric 50 (highest priority), others get 100, 110, 120...
+	// On macOS, OpenVPN often uses --redirect-gateway def1 which adds
+	// 0.0.0.0/1 and 128.0.0.0/1 routes. We need to prioritize these.
+	
 	for i, p := range profiles {
 		metric := 100 + (i * 10)
-		if p == winner { metric = 50 }
+		if p == winner { metric = 40 } // Winner gets highest priority
 		
 		ip := getVPNIPFromLog(p)
 		iface := findInterfaceByIP(ip)
 		if iface == "" { continue }
 
-		// On macOS, we use 'route add default -ifscope <iface> -metric <M>'
-		// However, it's safer to just set the metric for the specific interface
-		// We'll use 'sudo route change default -ifscope <iface> -metric <metric>'
-		exec.Command("sudo", "route", "change", "default", "-ifscope", iface, "-metric", strconv.Itoa(metric)).Run()
+		// Change metric for the specific interface's default routes.
+		// We target 'default', '0.0.0.0/1', and '128.0.0.0/1'.
+		destinations := []string{"default", "0.0.0.0/1", "128.0.0.0/1"}
+		
+		for _, dest := range destinations {
+			// We use 'route change' which is standard on macOS for modifying existing routes
+			// If it fails, it usually means the route doesn't exist for that destination/interface combo
+			exec.Command("sudo", "route", "change", "-net", dest, "-interface", iface, "-metric", strconv.Itoa(metric)).Run()
+			
+			// Also try without -net for 'default'
+			if dest == "default" {
+				exec.Command("sudo", "route", "change", "default", "-interface", iface, "-metric", strconv.Itoa(metric)).Run()
+			}
+		}
 	}
+	
+	// Add a small delay to let the OS apply routing changes
+	time.Sleep(500 * time.Millisecond)
 }
 
 func connectVPN(profile string, user string, password string) error {
@@ -784,12 +1138,19 @@ func onTrayReady() {
 				isPrimary := (p == lastWinner)
 				orchestratorMu.Unlock()
 				
+				ip := getVPNIPFromLog(p)
+				iface := findInterfaceByIP(ip)
+				currentActiveIfaceMu.Lock()
+				isActive := (iface != "" && iface == currentActiveInterface)
+				currentActiveIfaceMu.Unlock()
+				
 				isMoving := false
 				if s, ok := globalNetStats[p]; ok {
 					if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true }
 				}
 				
 				if isPrimary { title += " [PRIMARY]" }
+				if isActive { title += " [ACTIVE]" }
 				if isMoving { title += " [TRANS]" }
 			} else {
 				mItems[p].Uncheck()
@@ -1037,9 +1398,17 @@ func (m model) View() string {
 						orchestratorMu.Lock()
 						if p == lastWinner && connected { primaryStr = " [PRIMARY]" }
 						orchestratorMu.Unlock()
+
+						activeStr := ""
+						ip := getVPNIPFromLog(p)
+						iface := findInterfaceByIP(ip)
+						currentActiveIfaceMu.Lock()
+						if iface != "" && iface == currentActiveInterface { activeStr = " [ACTIVE]" }
+						currentActiveIfaceMu.Unlock()
+
 						activityStr := ""
 						if s.InSpeed > 1024 || s.OutSpeed > 512 { activityStr = " [TRANS]" }
-						speedInfo = fmt.Sprintf(" %s %s %s %s %s %s", downStyle.Render("↓"), formatSpeed(s.InSpeed), upStyle.Render("↑"), formatSpeed(s.OutSpeed), primaryStr, activityStr)
+						speedInfo = fmt.Sprintf(" %s %s %s %s %s %s %s", downStyle.Render("↓"), formatSpeed(s.InSpeed), upStyle.Render("↑"), formatSpeed(s.OutSpeed), primaryStr, activeStr, activityStr)
 					}
 				}
 				prefix := "  "; if m.cursor == i { prefix = "> " }

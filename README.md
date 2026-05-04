@@ -55,7 +55,13 @@ Full background operation via the macOS Menu Bar:
 - Centralized connection status.
 - Quick-action menu for connecting/disconnecting profiles.
 - **Intelligent Focus:** One-click shortcuts to launch the Dashboard or Terminal UI with automatic window focusing and un-minimizing.
-- **Auto-Close:** The TUI is designed to intelligently close its own window/tab upon quitting (`q`) to keep your workspace clean.
+### 9. **Intelligent Routing Engine** 🧠
+Eliminate 403 Forbidden errors automatically:
+- **Autonomous Discovery:** Automatically detects new network destinations from your browser traffic.
+- **Isolated Sequence Probing:** Tests each VPN profile in total isolation using temporary host-based routes to find the most responsive path.
+- **Application-Aware Selection:** Prioritizes VPN profiles that return successful HTTP status codes (2xx/3xx), automatically bypassing profiles that return 403 or 404.
+- **Active Connection Flushing:** Instantly kills "stale" browser connections using `pfctl` when a better route is found, forcing a seamless transition to the optimal VPN path.
+- **Negative Caching:** Intelligently caches unreachable IPs to prevent redundant probing and ensure ultra-low CPU overhead.
 
 ---
 

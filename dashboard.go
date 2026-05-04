@@ -27,6 +27,8 @@ void make_dashboard_frameless(void *w) {
 import "C"
 import (
 	"encoding/base64"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,6 +85,12 @@ func (d *Dashboard) Run() {
 				if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true }
 			}
 
+			isActive := false
+			iface := findInterfaceByIP(ip)
+			currentActiveIfaceMu.Lock()
+			if iface != "" && iface == currentActiveInterface { isActive = true }
+			currentActiveIfaceMu.Unlock()
+
 			stats[p] = map[string]interface{}{
 				"connected":  connected,
 				"ip":         ip,
@@ -91,6 +99,7 @@ func (d *Dashboard) Run() {
 				"latency":    lat,
 				"isPrimary":  isPrimary,
 				"isMoving":   isMoving,
+				"isActive":   isActive,
 			}
 		}
 
@@ -167,6 +176,86 @@ func (d *Dashboard) Run() {
 		triggerReoptimization()
 	})
 
+	d.w.Bind("probeHost", func(host string) map[string]interface{} {
+		// 1. Resolve host
+		ips, err := net.LookupIP(host)
+		if err != nil || len(ips) == 0 {
+			return map[string]interface{}{"error": "Could not resolve host: " + host}
+		}
+		targetIP := ips[0].String()
+
+		// 2. Parallel Probing
+		refreshProfiles()
+		var active []string
+		for _, p := range profiles {
+			if isProfileConnected(p) { active = append(active, p) }
+		}
+
+		if len(active) == 0 {
+			return map[string]interface{}{"error": "No active VPN profiles to probe through"}
+		}
+
+		type result struct {
+			profile string
+			latency float64
+			err     error
+		}
+		resChan := make(chan result, len(active))
+
+		for _, p := range active {
+			go func(prof string) {
+				lat, err := probeHostThroughProfile(prof, targetIP)
+				resChan <- result{prof, lat, err}
+			}(p)
+		}
+
+		bestLat := 9999.0
+		var bestProfile string
+		details := make(map[string]string)
+
+		for i := 0; i < len(active); i++ {
+			r := <-resChan
+			if r.err == nil {
+				details[r.profile] = fmt.Sprintf("%.1fms", r.latency)
+				if r.latency < bestLat {
+					bestLat = r.latency
+					bestProfile = r.profile
+				}
+			} else {
+				details[r.profile] = "TIMEOUT/FAIL"
+			}
+		}
+
+		if bestProfile != "" {
+			// 3. Apply Route
+			err := applyHostRoute(targetIP, bestProfile)
+			if err != nil {
+				return map[string]interface{}{"error": "Failed to apply route: " + err.Error()}
+			}
+
+			// 4. Cache it
+			hostRouteCacheMu.Lock()
+			hostRouteCache[host] = HostRouteEntry{
+				IP:        targetIP,
+				Profile:   bestProfile,
+				Timestamp: time.Now(),
+			}
+			hostRouteCacheMu.Unlock()
+
+			addAuditLog(fmt.Sprintf("Smart Route: %s -> %s (%.1fms)", host, bestProfile, bestLat), "success")
+			return map[string]interface{}{
+				"success": true,
+				"winner":  bestProfile,
+				"latency": bestLat,
+				"details": details,
+				"ip":      targetIP,
+			}
+		}
+
+		addAuditLog(fmt.Sprintf("Smart Route Failed: %s is unreachable on all VPNs", host), "warning")
+		return map[string]interface{}{"error": "Host is unreachable through all active VPNs"}
+	})
+
 	d.w.SetHtml(d.getHTML())
 	C.focus_window(d.w.Window())
 	d.w.Run()
@@ -218,6 +307,9 @@ func (d *Dashboard) getHTML() string {
         #apply-to-all:checked + div { border-color: #5F5CF1; background: rgba(95, 92, 241, 0.1); }
         button:disabled { opacity: 0.5; cursor: not-allowed; filter: grayscale(1); }
         
+        .shimmer { background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent); background-size: 200% 100%; animation: shimmer 2s infinite; }
+        @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+
         .wave-animation { display: flex; align-items: flex-end; gap: 2px; height: 12px; }
         .wave-bar { width: 2px; background: #00FF88; border-radius: 1px; animation: wave 1s infinite ease-in-out; }
         .wave-bar:nth-child(2) { animation-delay: 0.2s; }
@@ -244,6 +336,10 @@ func (d *Dashboard) getHTML() string {
                 <div id="optimize-btn" onclick="manualOptimize()" class="flex items-center gap-2 px-3 py-1.5 bg-primary/10 rounded-full border border-primary/20 hover:border-primary/50 cursor-pointer transition-all group">
                     <span id="optimize-icon" class="material-symbols-outlined text-[14px] text-primary transition-all">bolt</span>
                     <span class="text-[10px] font-bold text-primary uppercase tracking-widest leading-none">OPTIMIZE</span>
+                </div>
+                <div onclick="openProbeModal()" class="flex items-center gap-2 px-3 py-1.5 bg-secondary/10 rounded-full border border-secondary/20 hover:border-secondary/50 cursor-pointer transition-all group">
+                    <span class="material-symbols-outlined text-[14px] text-secondary transition-all">search_check</span>
+                    <span class="text-[10px] font-bold text-secondary uppercase tracking-widest leading-none">PROBE HOST</span>
                 </div>
                 <span onclick="refresh()" class="material-symbols-outlined text-slate-500 cursor-pointer hover:text-primary transition-colors">refresh</span>
             </div>
@@ -289,12 +385,25 @@ func (d *Dashboard) getHTML() string {
                 </div>
 
                 <div class="glass-panel rounded-xl p-4 flex flex-col gap-3 flex-1 min-h-0">
-                    <h3 class="text-[10px] font-bold text-outline opacity-50 uppercase tracking-widest flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[14px]">history</span>
-                        Network Events
+                    <h3 class="text-[10px] font-bold text-outline opacity-50 uppercase tracking-widest flex items-center justify-between">
+                        <div class="flex items-center gap-2">
+                            <span class="material-symbols-outlined text-[14px]">history</span>
+                            Network Events
+                        </div>
+                        <span id="audit-count" class="bg-white/5 px-1.5 py-0.5 rounded text-[8px]">0</span>
                     </h3>
                     <div id="audit-log" class="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar text-[10px]">
                         <!-- Logs here -->
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-4 flex flex-col gap-3">
+                    <h3 class="text-[10px] font-bold text-outline opacity-50 uppercase tracking-widest flex items-center gap-2">
+                        <span class="material-symbols-outlined text-[14px]">route</span>
+                        Active Smart Routes
+                    </h3>
+                    <div id="active-routes" class="flex flex-col gap-2 text-[9px]">
+                        <div class="opacity-20 italic">No specific host routes injected</div>
                     </div>
                 </div>
             </div>
@@ -386,6 +495,29 @@ func (d *Dashboard) getHTML() string {
                 </div>
             </div>
         </div>
+
+        <div id="probe-modal" class="fixed inset-0 z-[130] hidden flex items-center justify-center bg-surface/80 backdrop-blur-md">
+            <div class="w-full max-w-md mx-4 glass-panel rounded-xl overflow-hidden shadow-2xl border border-secondary/20">
+                <div class="p-6 border-b border-white/5">
+                    <span class="text-[10px] font-label-caps text-outline uppercase tracking-widest">Intelligent Probing</span>
+                    <h1 class="text-xl font-bold text-on-surface mt-1">PROBE NEW HOST</h1>
+                    <p class="text-[10px] text-outline mt-1 uppercase tracking-tight">Test connectivity through all active VPNs and auto-apply the best route.</p>
+                </div>
+                <div class="p-6 flex flex-col gap-4">
+                    <div class="flex flex-col gap-1">
+                        <span class="text-[9px] text-outline uppercase tracking-widest px-1">Target Domain / IP</span>
+                        <input id="probe-host-input" type="text" placeholder="e.g. mon.s.sicepat.tech" class="w-full bg-white/5 border-b border-secondary/30 p-2 text-lg font-bold outline-none focus:border-secondary transition-all text-center">
+                    </div>
+                    
+                    <div id="probe-results" class="hidden flex flex-col gap-2 bg-black/20 p-3 rounded-lg border border-white/5">
+                        <!-- Results here -->
+                    </div>
+
+                    <button id="start-probe-btn" class="w-full py-4 bg-secondary text-surface font-bold rounded-lg uppercase tracking-widest active:scale-95 transition-all mt-2">Start Parallel Probe</button>
+                    <button id="close-probe-btn" onclick="closeProbeModal()" class="w-full text-[10px] text-outline uppercase py-2">Cancel</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -444,6 +576,7 @@ func (d *Dashboard) getHTML() string {
                 // Update Audit Logs
                 const logContainer = document.getElementById('audit-log');
                 if (data.auditLogs && data.auditLogs.length > 0) {
+                    document.getElementById('audit-count').innerText = data.auditLogs.length;
                     const logHtml = data.auditLogs.slice().reverse().map(entry => {
                         const time = new Date(entry.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
                         let colorClass = 'text-outline';
@@ -457,6 +590,35 @@ func (d *Dashboard) getHTML() string {
                     logContainer.innerHTML = logHtml;
                 } else {
                     logContainer.innerHTML = '<div class="opacity-20 italic">No events recorded yet</div>';
+                }
+
+                // Update Active Smart Routes
+                const routeContainer = document.getElementById('active-routes');
+                const smartLogs = (data.auditLogs || []).filter(l => l.message.includes("Smart Route:"));
+                if (smartLogs.length > 0) {
+                    const uniqueRoutes = {};
+                    smartLogs.forEach(l => {
+                        const match = l.message.match(/Smart Route: (.*) -> (.*) \((.*)\)/);
+                        if (match) uniqueRoutes[match[1]] = { profile: match[2], lat: match[3] };
+                    });
+                    
+                    let routeHtml = '';
+                    for (const host in uniqueRoutes) {
+                        const r = uniqueRoutes[host];
+                        routeHtml += '<div class="flex items-center justify-between p-2 bg-white/5 rounded border border-white/5 group">' +
+                                        '<div class="flex flex-col">' +
+                                            '<span class="font-bold text-on-surface">' + host + '</span>' +
+                                            '<span class="opacity-40 text-[8px] uppercase tracking-tighter">ROUTED VIA ' + r.profile + '</span>' +
+                                        '</div>' +
+                                        '<div class="flex items-center gap-2">' +
+                                            '<span class="text-secondary font-mono">' + r.lat + '</span>' +
+                                            '<span class="material-symbols-outlined text-[10px] text-outline group-hover:text-red-400 cursor-pointer">close</span>' +
+                                        '</div>' +
+                                     '</div>';
+                    }
+                    routeContainer.innerHTML = routeHtml;
+                } else {
+                    routeContainer.innerHTML = '<div class="opacity-20 italic">No active smart routes</div>';
                 }
 
                 // Find best profile
@@ -510,13 +672,15 @@ func (d *Dashboard) getHTML() string {
                     if (s.connected) {
                         const latColor = s.latency < 100 ? 'text-secondary' : (s.latency < 300 ? 'text-yellow-500' : 'text-red-500');
                         const isBest = s.isPrimary ? '<span class="bg-secondary/20 text-secondary text-[8px] px-1.5 py-0.5 rounded ml-2 border border-secondary/30 font-bold tracking-tight">PRIMARY ROUTE</span>' : '';
-                        
+                        const isActive = s.isActive ? '<span class="bg-blue-500/20 text-blue-400 text-[8px] px-1.5 py-0.5 rounded ml-2 border border-blue-500/30 font-bold tracking-tight">ACTIVE ROUTE</span>' : '';
+                        const mismatch = (s.isPrimary && !s.isActive) ? '<span class="bg-red-500/20 text-red-400 text-[8px] px-1.5 py-0.5 rounded ml-2 border border-red-500/30 font-bold tracking-tight animate-pulse">MISMATCH</span>' : '';
+
                         let activity = '';
                         if (s.isMoving) {
                             activity = '<div class="wave-animation ml-3"><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><span class="text-[8px] text-secondary font-bold ml-1 uppercase">DATA FLOWING</span></div>';
                         }
                         
-                        latBadge = '<span class="' + latColor + ' font-mono text-[10px] ml-3">' + Math.round(s.latency) + 'ms</span>' + isBest + activity;
+                        latBadge = '<span class="' + latColor + ' font-mono text-[10px] ml-3">' + Math.round(s.latency) + 'ms</span>' + isBest + isActive + mismatch + activity;
                     }
 
                     html += '<div onclick="selectProfile(\'' + p + '\')" ondblclick="handleAction(\'' + p + '\', ' + s.connected + ')" class="glass-panel rounded-xl p-4 flex items-center justify-between transition-all cursor-pointer border ' + activeClass + '">' +
@@ -633,6 +797,59 @@ func (d *Dashboard) getHTML() string {
             await performConnect(selectedProfile, user, pwd);
         };
 
+        function openProbeModal() {
+            document.getElementById('probe-host-input').value = '';
+            document.getElementById('probe-results').classList.add('hidden');
+            document.getElementById('probe-modal').classList.remove('hidden');
+            document.getElementById('probe-host-input').focus();
+        }
+
+        function closeProbeModal() {
+            if (document.getElementById('start-probe-btn').disabled) return;
+            document.getElementById('probe-modal').classList.add('hidden');
+        }
+
+        document.getElementById('start-probe-btn').onclick = async () => {
+            const host = document.getElementById('probe-host-input').value.trim();
+            if (!host) return;
+
+            const btn = document.getElementById('start-probe-btn');
+            const resDiv = document.getElementById('probe-results');
+            const originalText = btn.innerText;
+
+            btn.innerText = 'PROBING ACROSS VPNS...';
+            btn.disabled = true;
+            resDiv.innerHTML = '<div class="shimmer h-8 rounded mb-2"></div><div class="shimmer h-8 rounded"></div>';
+            resDiv.classList.remove('hidden');
+
+            try {
+                const res = await probeHost(host);
+                if (res.error) {
+                    resDiv.innerHTML = '<div class="text-red-400 font-bold uppercase text-[10px] p-2">' + res.error + '</div>';
+                } else {
+                    let html = '<div class="text-[10px] font-bold text-secondary uppercase mb-2">SUCCESS: ROUTED TO ' + res.winner + '</div>';
+                    html += '<div class="flex flex-col gap-1">';
+                    for (const prof in res.details) {
+                        const lat = res.details[prof];
+                        const isWinner = prof === res.winner;
+                        html += '<div class="flex justify-between items-center text-[9px] ' + (isWinner ? 'text-secondary font-bold' : 'text-outline') + '">' +
+                                    '<span>' + prof + '</span>' +
+                                    '<span>' + lat + '</span>' +
+                                '</div>';
+                    }
+                    html += '</div>';
+                    resDiv.innerHTML = html;
+                    
+                    setTimeout(() => { closeProbeModal(); refresh(); }, 2000);
+                }
+            } catch (e) {
+                resDiv.innerHTML = '<div class="text-red-400 font-bold uppercase text-[10px] p-2">CRITICAL ERROR</div>';
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        };
+
         async function handleImportAction() {
             const res = await importProfile();
             if (res && res.path && res.name) {
@@ -703,7 +920,7 @@ func (d *Dashboard) getHTML() string {
                     }
                 }
             }
-            if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); }
+            if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); closeProbeModal(); }
         });
 
         async function manualOptimize() {
