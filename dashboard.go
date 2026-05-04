@@ -326,7 +326,7 @@ func (d *Dashboard) getHTML() string {
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
             <div class="flex items-center gap-3">
                 <img id="app-icon" src="" class="w-8 h-8 drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] hidden" />
-                <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.4.0</span>
+                <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.4.1</span>
             </div>
             <div class="flex gap-4 items-center">
                 <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
