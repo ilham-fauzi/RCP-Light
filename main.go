@@ -54,6 +54,11 @@ type vpnCred struct {
 	pass string
 }
 
+type TrayProfileItem struct {
+	item    *systray.MenuItem
+	profile string
+}
+
 var (
 	configDir  string
 	openvpnBin string
@@ -81,6 +86,9 @@ var (
 	lastWinner         string
 	lastWinnerLatency  float64
 	orchestratorMu     sync.Mutex
+
+	trayItems   [50]*TrayProfileItem
+	trayItemsMu sync.Mutex
 
 	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#5F5CF1")).Padding(0, 1).Bold(true)
 	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00D7FF")).Bold(true)
@@ -159,6 +167,66 @@ func saveSharedCredentials(u, p string) {
 	os.WriteFile(path, []byte(u+"\n"+p), 0600)
 }
 
+func getProfileCredentials(profile string) (string, string) {
+	path := filepath.Join(configDir, profile+".cred")
+	content, err := os.ReadFile(path)
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		if len(lines) >= 2 {
+			return strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1])
+		}
+	}
+	return "", ""
+}
+
+func hasProfileCredentials(profile string) bool {
+	path := filepath.Join(configDir, profile+".cred")
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func saveProfileCredentials(profile string, u, p string) {
+	path := filepath.Join(configDir, profile+".cred")
+	os.WriteFile(path, []byte(u+"\n"+p), 0600)
+}
+
+func deleteProfileCredentials(profile string) {
+	path := filepath.Join(configDir, profile+".cred")
+	os.Remove(path)
+}
+
+func getProfilesWithCustomCredentials() []string {
+	var list []string
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		return list
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") {
+			name := strings.TrimSuffix(entry.Name(), ".cred")
+			if name != "session" {
+				list = append(list, name)
+			}
+		}
+	}
+	return list
+}
+
+func clearAllCustomCredentials() {
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") {
+			name := strings.TrimSuffix(entry.Name(), ".cred")
+			if name != "session" {
+				os.Remove(filepath.Join(configDir, entry.Name()))
+			}
+		}
+	}
+}
+
 func refreshProfiles() {
 	vpnStateMu.Lock()
 	defer vpnStateMu.Unlock()
@@ -170,10 +238,14 @@ func refreshProfiles() {
 		return
 	}
 	var newProfiles []string
+	seen := make(map[string]bool)
 	for _, entry := range entries {
 		ext := filepath.Ext(entry.Name())
 		if !entry.IsDir() && strings.EqualFold(ext, ".ovpn") {
 			name := strings.TrimSuffix(entry.Name(), ext)
+			if seen[strings.ToLower(name)] { continue }
+			seen[strings.ToLower(name)] = true
+			
 			newProfiles = append(newProfiles, name)
 			profileMap[name] = entry.Name()
 			os.Chmod(filepath.Join(configDir, entry.Name()), 0644)
@@ -219,6 +291,7 @@ func sanitizeOvpn(filePath string) error {
 	if err != nil { return err }
 	lines := strings.Split(string(content), "\n")
 	var newLines []string
+	hasAuthUserPass := false
 	// NOTE: persist-key and persist-tun are intentionally NOT removed — they are essential
 	// for connection resilience when network is interrupted (laptop sleep, brief disconnects).
 	// persist-key  → keeps TLS keys in memory so re-auth is not needed after network recovery
@@ -227,12 +300,40 @@ func sanitizeOvpn(filePath string) error {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") { newLines = append(newLines, line); continue }
-		if strings.HasPrefix(strings.ToLower(trimmed), "auth-user-pass") { continue }
+		if strings.HasPrefix(strings.ToLower(trimmed), "auth-user-pass") {
+			hasAuthUserPass = true
+			continue
+		}
 		if reRemove.MatchString(trimmed) { continue }
 		newLines = append(newLines, line)
 	}
-	newLines = append(newLines, "auth-user-pass")
+	if hasAuthUserPass {
+		newLines = append(newLines, "auth-user-pass")
+	}
 	return os.WriteFile(filePath, []byte(strings.Join(newLines, "\n")), 0644)
+}
+
+func profileRequiresAuth(profile string) bool {
+	ovpnFile := profileMap[profile]
+	if ovpnFile == "" {
+		return false
+	}
+	ovpnPath := filepath.Join(configDir, ovpnFile)
+	content, err := os.ReadFile(ovpnPath)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(trimmed), "auth-user-pass") {
+			return true
+		}
+	}
+	return false
 }
 
 func setupTouchID() {
@@ -304,11 +405,29 @@ func main() {
 	if len(os.Args) > 2 && os.Args[1] == "connect-ui" {
 		profile := os.Args[2]
 		refreshProfiles()
+		if !profileRequiresAuth(profile) {
+			connectVPN(profile, "", "")
+			return
+		}
 		defU := sharedUser; if defU == "" { defU = username }
-		res := showLoginWindow(profile, defU, sharedPass)
+		defP := sharedPass
+		saveMode := "apply_all"
+		if hasProfileCredentials(profile) {
+			defU, defP = getProfileCredentials(profile)
+			saveMode = "save_profile"
+		} else if sharedPass == "" {
+			saveMode = "none"
+		}
+		
+		res := showLoginWindow(profile, defU, defP, saveMode)
 		if !res.canceled {
-			if res.applyAll {
+			if res.saveMode == "apply_all" {
 				saveSharedCredentials(res.user, res.password)
+				deleteProfileCredentials(profile)
+			} else if res.saveMode == "save_profile" {
+				saveProfileCredentials(profile, res.user, res.password)
+			} else {
+				deleteProfileCredentials(profile)
 			}
 			connectVPN(profile, res.user, res.password)
 		}
@@ -620,11 +739,9 @@ func probeHostHTTPStatus(profile string, targetIP string) (int, error) {
 		}
 	}
 
-	doGet := func(proto string) (int, error) {
+	doGet := func(proto, host string) (int, error) {
 		req, _ := http.NewRequest("GET", proto+"://"+targetIP, nil)
-		if hostname != "" {
-			req.Host = hostname
-		}
+		if host != "" { req.Host = host }
 		resp, err := client.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
@@ -633,22 +750,26 @@ func probeHostHTTPStatus(profile string, targetIP string) (int, error) {
 		return 0, err
 	}
 
-	// Try HTTPS first
-	status, err := doGet("https")
-	if err == nil {
-		fmt.Printf("   [HTTP] %-10s -> %s (%s): Status %d\n", profile, targetIP, hostname, status)
-		return status, nil
-	}
-	
-	// Fallback to HTTP
-	status, err = doGet("http")
-	if err == nil {
-		fmt.Printf("   [HTTP] %-10s -> %s (%s): Status %d\n", profile, targetIP, hostname, status)
-		return status, nil
+	// 1. Try with discovered hostname
+	status, err := doGet("https", hostname)
+	if err == nil && status < 400 { return status, nil }
+
+	// 2. If 403/404, try with common suffixes if hostname is just a short name
+	if (status == 403 || status == 404 || hostname == "") && (strings.HasPrefix(targetIP, "10.") || strings.HasPrefix(targetIP, "172.")) {
+		suffixes := []string{"sicepat.tech", "sicepat.lan", "sicepat.id"}
+		for _, s := range suffixes {
+			h := hostname; if h == "" { h = "server" }
+			if !strings.Contains(h, ".") { h = h + "." + s }
+			st, err := doGet("https", h)
+			if err == nil && st < 400 { return st, nil }
+		}
 	}
 
-	fmt.Printf("   [HTTP] %-10s -> %s (%s): FAILED (%v)\n", profile, targetIP, hostname, err)
-	return 0, err
+	// 3. Last resort: Try IP directly (HTTPS then HTTP)
+	if status, err := doGet("https", ""); err == nil { return status, nil }
+	if status, err := doGet("http", ""); err == nil { return status, nil }
+
+	return 0, fmt.Errorf("probe failed")
 }
 
 func applyHostRoute(targetIP string, profile string) error {
@@ -676,8 +797,17 @@ func applyHostRoute(targetIP string, profile string) error {
 
 func triggerReoptimization() {
 	go func() {
+		// Clear host route cache and system routes to force fresh sequential testing
+		hostRouteCacheMu.Lock()
+		for _, entry := range hostRouteCache {
+			exec.Command("sudo", "route", "delete", "-host", entry.IP).Run()
+		}
+		hostRouteCache = make(map[string]HostRouteEntry)
+		hostRouteCacheMu.Unlock()
+
 		orchestrateOnce()
 		flushDNS()
+		addAuditLog("Manual Re-optimization: All smart routes reset", "info")
 	}()
 }
 
@@ -824,10 +954,16 @@ func monitorAndProbeTraffic() {
 		}
 
 		hostRouteCacheMu.Lock()
-		_, exists := hostRouteCache[targetIP]
+		entry, exists := hostRouteCache[targetIP]
 		hostRouteCacheMu.Unlock()
 
-		if !exists {
+		// SMART RE-VALIDATION LOGIC:
+		// 1. If host not in cache -> Probe immediately.
+		// 2. If host marked "NONE" -> Retry probe (maybe a VPN just connected).
+		// 3. If route is older than 30 minutes -> Re-probe to ensure it's still optimal.
+		shouldProbe := !exists || entry.Profile == "NONE" || time.Since(entry.Timestamp) > 30*time.Minute
+
+		if shouldProbe {
 			// Quietly probe in the background
 			go func(ip string, active []string) {
 				type resEntry struct {
@@ -838,8 +974,6 @@ func monitorAndProbeTraffic() {
 				var results []resEntry
 				
 				// SEQUENTIAL ISOLATED PROBING
-				// We test each profile one by one, giving it a temporary /32 route
-				// to ensure the probe traffic ONLY goes through that specific tunnel.
 				for _, p := range active {
 					ipAddr := getVPNIPFromLog(p)
 					iface := findInterfaceByIP(ipAddr)
@@ -849,6 +983,9 @@ func monitorAndProbeTraffic() {
 					exec.Command("sudo", "route", "delete", "-host", ip).Run()
 					exec.Command("sudo", "route", "add", "-host", ip, "-interface", iface).Run()
 					
+					// Settle delay for OS routing table
+					time.Sleep(150 * time.Millisecond)
+
 					// 2. Perform isolated probe
 					lat, err := probeHostThroughProfile(p, ip)
 					status := 0
@@ -859,25 +996,36 @@ func monitorAndProbeTraffic() {
 
 					// 3. Cleanup temporary route
 					exec.Command("sudo", "route", "delete", "-host", ip).Run()
+					exec.Command("sudo", "pfctl", "-k", ip).Run() // Flush state for this specific IP
 				}
 
 				bestLat := 9999.0
 				bestProfile := ""
 				
-				// Priority 1: Profiles that give TRUE Success (2xx or 3xx status)
+				// STRICT: Priority 1: Profiles that give 200 OK
 				for _, r := range results {
-					if r.status >= 200 && r.status < 400 {
-						if r.latency < bestLat {
+					if r.status == 200 {
+						isProd := strings.Contains(strings.ToLower(r.profile), "prod")
+						if bestProfile == "" || (isProd && !strings.Contains(strings.ToLower(bestProfile), "prod")) || (isProd == strings.Contains(strings.ToLower(bestProfile), "prod") && r.latency < bestLat) {
 							bestLat = r.latency
 							bestProfile = r.profile
 						}
 					}
 				}
 
-				// STRICT: No fallback to 404/403. 
-				// If no success found, cache as "negative" to stop flooding
+				// If NO 200 OK found, we check if one is unambiguously "better" (e.g. 201, 204, or 403 on prod)
+				if bestProfile == "" {
+					for _, r := range results {
+						if r.status > 200 && r.status < 300 {
+							bestProfile = r.profile; bestLat = r.latency; break
+						}
+					}
+				}
+
+				// AMBIGUITY CHECK: If still no profile, DO NOT force route.
 				if bestProfile == "" {
 					hostRouteCacheMu.Lock()
+					// Negative cache for a shorter time to allow retries
 					hostRouteCache[ip] = HostRouteEntry{IP: ip, Profile: "NONE", Timestamp: time.Now()}
 					hostRouteCacheMu.Unlock()
 					return 
@@ -960,12 +1108,19 @@ func connectVPN(profile string, user string, password string) error {
 	pidPath := filepath.Join(configDir, profile+".pid")
 	os.Remove(logPath); os.Remove(pidPath)
 	os.WriteFile(logPath, []byte(""), 0666)
-	tmpAuthPath := filepath.Join(configDir, ".tmp_auth_"+profile)
-	os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
 
-	cmd := exec.Command("sudo", openvpnBin,
-		"--config", ovpnPath,
-		"--auth-user-pass", tmpAuthPath,
+	requiresAuth := profileRequiresAuth(profile)
+	var tmpAuthPath string
+	if requiresAuth {
+		tmpAuthPath = filepath.Join(configDir, ".tmp_auth_"+profile)
+		os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
+	}
+
+	args := []string{openvpnBin, "--config", ovpnPath}
+	if requiresAuth {
+		args = append(args, "--auth-user-pass", tmpAuthPath)
+	}
+	args = append(args,
 		"--daemon",
 		"--log", logPath,
 		"--writepid", pidPath,
@@ -982,9 +1137,13 @@ func connectVPN(profile string, user string, password string) error {
 		// Disable inactivity timeout
 		"--inactive", "0",
 	)
+
+	cmd := exec.Command("sudo", args...)
 	_, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Remove(tmpAuthPath)
+		if requiresAuth {
+			os.Remove(tmpAuthPath)
+		}
 		return fmt.Errorf("OpenVPN Start Error: %v", err)
 	}
 
@@ -993,11 +1152,13 @@ func connectVPN(profile string, user string, password string) error {
 		time.Sleep(500 * time.Millisecond)
 		if !isProfileConnected(profile) {
 			logContent, _ := os.ReadFile(logPath)
-			if strings.Contains(string(logContent), "AUTH_FAILED") {
+			if requiresAuth && strings.Contains(string(logContent), "AUTH_FAILED") {
 				os.Remove(tmpAuthPath)
 				return fmt.Errorf("AUTHENTICATION FAILED")
 			}
-			os.Remove(tmpAuthPath)
+			if requiresAuth {
+				os.Remove(tmpAuthPath)
+			}
 			return fmt.Errorf("Connection terminated unexpectedly")
 		}
 		logContent, _ := os.ReadFile(logPath)
@@ -1015,7 +1176,9 @@ func connectVPN(profile string, user string, password string) error {
 	go vpnWatchdog(profile)
 
 	// Clean up auth file after a short delay
-	go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
+	if requiresAuth {
+		go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
+	}
 	return nil
 }
 
@@ -1071,12 +1234,19 @@ func connectVPNDirect(profile string, user string, password string) error {
 	pidPath := filepath.Join(configDir, profile+".pid")
 	os.Remove(logPath); os.Remove(pidPath)
 	os.WriteFile(logPath, []byte(""), 0666)
-	tmpAuthPath := filepath.Join(configDir, ".tmp_auth_"+profile)
-	os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
 
-	cmd := exec.Command("sudo", openvpnBin,
-		"--config", ovpnPath,
-		"--auth-user-pass", tmpAuthPath,
+	requiresAuth := profileRequiresAuth(profile)
+	var tmpAuthPath string
+	if requiresAuth {
+		tmpAuthPath = filepath.Join(configDir, ".tmp_auth_"+profile)
+		os.WriteFile(tmpAuthPath, []byte(fmt.Sprintf("%s\n%s", user, password)), 0600)
+	}
+
+	args := []string{openvpnBin, "--config", ovpnPath}
+	if requiresAuth {
+		args = append(args, "--auth-user-pass", tmpAuthPath)
+	}
+	args = append(args,
 		"--daemon",
 		"--log", logPath,
 		"--writepid", pidPath,
@@ -1088,8 +1258,12 @@ func connectVPNDirect(profile string, user string, password string) error {
 		"--connect-retry-max", "0",
 		"--inactive", "0",
 	)
+
+	cmd := exec.Command("sudo", args...)
 	_, err := cmd.CombinedOutput()
-	go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
+	if requiresAuth {
+		go func() { time.Sleep(15 * time.Second); os.Remove(tmpAuthPath) }()
+	}
 	return err
 }
 
@@ -1112,13 +1286,39 @@ func disconnectVPN(profile string) {
 func onTrayReady() {
 	systray.SetIcon(trayIconData)
 	systray.SetTitle("")
-	mItems := make(map[string]*systray.MenuItem)
 	mOpenDashboard := systray.AddMenuItem("Open RCP Light Dashboard", "")
 	mOpenUI := systray.AddMenuItem("Open Terminal UI", "")
 	systray.AddSeparator()
-	for _, p := range profiles {
-		mItems[p] = systray.AddMenuItem(p, "")
+
+	// Pre-create the pool of dynamic profile items
+	for i := 0; i < 50; i++ {
+		item := systray.AddMenuItem("", "")
+		item.Hide()
+		trayItems[i] = &TrayProfileItem{
+			item:    item,
+			profile: "",
+		}
+		
+		go func(index int, tItem *TrayProfileItem) {
+			for range tItem.item.ClickedCh {
+				trayItemsMu.Lock()
+				p := tItem.profile
+				trayItemsMu.Unlock()
+				if p == "" { continue }
+				
+				if isProfileConnected(p) {
+					disconnectVPN(p)
+				} else {
+					if !profileRequiresAuth(p) {
+						connectVPN(p, "", "")
+					} else {
+						openLoginWindowSubprocess(p)
+					}
+				}
+			}
+		}(i, trayItems[i])
 	}
+
 	systray.AddSeparator()
 	mLastEvent := systray.AddMenuItem("Ready", "")
 	mLastEvent.Disable()
@@ -1126,13 +1326,32 @@ func onTrayReady() {
 	mQuit := systray.AddMenuItem("Quit", "")
 
 	updateTray := func() {
+		trayItemsMu.Lock()
+		defer trayItemsMu.Unlock()
+
+		// 1. Assign active profiles to slots
+		for i := 0; i < 50; i++ {
+			if i < len(profiles) {
+				trayItems[i].profile = profiles[i]
+			} else {
+				trayItems[i].profile = ""
+			}
+		}
+
+		// 2. Update titles, checks, and visibility
 		activeCount := 0
-		for _, p := range profiles {
+		for i := 0; i < 50; i++ {
+			p := trayItems[i].profile
+			if p == "" {
+				trayItems[i].item.Hide()
+				continue
+			}
+
 			connected := isProfileConnected(p)
 			title := p
 			if connected {
 				activeCount++
-				mItems[p].Check()
+				trayItems[i].item.Check()
 				
 				orchestratorMu.Lock()
 				isPrimary := (p == lastWinner)
@@ -1153,9 +1372,10 @@ func onTrayReady() {
 				if isActive { title += " [ACTIVE]" }
 				if isMoving { title += " [TRANS]" }
 			} else {
-				mItems[p].Uncheck()
+				trayItems[i].item.Uncheck()
 			}
-			mItems[p].SetTitle(title)
+			trayItems[i].item.SetTitle(title)
+			trayItems[i].item.Show()
 		}
 
 		auditMu.Lock()
@@ -1165,19 +1385,6 @@ func onTrayReady() {
 		auditMu.Unlock()
 
 		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
-	}
-	for _, p := range profiles {
-		go func(p string, m *systray.MenuItem) {
-			for {
-				<-m.ClickedCh
-				if isProfileConnected(p) {
-					disconnectVPN(p)
-				} else {
-					openLoginWindowSubprocess(p)
-				}
-				updateTray()
-			}
-		}(p, mItems[p])
 	}
 
 	go func() {
@@ -1189,7 +1396,7 @@ func onTrayReady() {
 			}
 		}
 	}()
-	go func() { for { time.Sleep(3 * time.Second); updateTray() } }()
+	go func() { for { time.Sleep(1 * time.Second); updateTray() } }()
 }
 
 const (
@@ -1201,6 +1408,7 @@ const (
 	stateConfirmDelete
 	stateRenameImport
 	stateUsername
+	stateConfirmOverwrite
 )
 
 type model struct {
@@ -1219,6 +1427,7 @@ type model struct {
 	tempUser   string
 	tempPass   string
 	applyAll   bool
+	saveMode   int // 0 = apply_all, 1 = save_profile, 2 = none
 }
 
 func initialModel() model {
@@ -1234,6 +1443,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.frame++
 		if m.frame%10 == 0 { m.pulseState = !m.pulseState }
 		m.connected = make(map[string]bool)
+		// Keep choices in sync with global profiles (handles dynamic imports/deletes/renames)
+		m.choices = profiles
+		if m.cursor >= len(m.choices) && len(m.choices) > 0 {
+			m.cursor = len(m.choices) - 1
+		}
 		for _, p := range profiles {
 			m.connected[p] = isProfileConnected(p)
 			if m.connected[p] { m.ips[p] = getVPNIPFromLog(p) }
@@ -1242,7 +1456,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Tick(time.Millisecond*80, func(t time.Time) tea.Msg { return t })
 	case tea.KeyMsg:
 		if m.state == stateConnecting { return m, nil }
-		switch msg.String() {
+		keyStr := msg.String()
+		isInputState := (m.state == stateConnUser || m.state == stateConnPass || m.state == stateUsername || m.state == stateRenameImport)
+		
+		if isInputState {
+			switch keyStr {
+			case "ctrl+c":
+				closeTerminal()
+				return m, tea.Quit
+			case "esc":
+				m.state = stateSelect
+				m.statusMsg = ""
+				return m, nil
+			case "tab":
+				if m.state == stateConnUser || m.state == stateConnPass {
+					m.saveMode = (m.saveMode + 1) % 3
+				}
+				return m, nil
+			case "enter":
+				if m.state == stateConnUser {
+					m.tempUser = m.input.Value()
+					m.state = stateConnPass; m.input.EchoMode = textinput.EchoPassword
+					m.input.Prompt = ""; m.input.SetValue(""); m.input.Focus()
+				} else if m.state == stateConnPass {
+					m.tempPass = m.input.Value()
+					if m.tempPass == "" {
+						if m.saveMode == 1 && hasProfileCredentials(m.choices[m.cursor]) {
+							_, m.tempPass = getProfileCredentials(m.choices[m.cursor])
+						} else if m.saveMode == 0 && sharedPass != "" {
+							m.tempPass = sharedPass
+						}
+					}
+					p := m.choices[m.cursor]
+					if m.saveMode == 0 {
+						customList := getProfilesWithCustomCredentials()
+						if len(customList) > 0 {
+							m.state = stateConfirmOverwrite
+							return m, nil
+						}
+						saveSharedCredentials(m.tempUser, m.tempPass)
+						deleteProfileCredentials(p)
+					} else if m.saveMode == 1 {
+						saveProfileCredentials(p, m.tempUser, m.tempPass)
+					} else {
+						deleteProfileCredentials(p)
+					}
+					m.state = stateConnecting
+					return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
+				} else if m.state == stateRenameImport {
+					newName := strings.TrimSpace(m.input.Value())
+					if newName != "" {
+						newName = strings.TrimSuffix(newName, ".ovpn"); dst := filepath.Join(configDir, newName+".ovpn")
+						exec.Command("cp", m.importPath, dst).Run()
+						sanitizeOvpn(dst)
+						m.state = stateSelect
+					}
+				} else if m.state == stateUsername {
+					saveUsername(m.input.Value()); m.state = stateSelect
+				}
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		}
+
+		switch keyStr {
 		case "ctrl+c", "q": 
 			closeTerminal()
 			return m, tea.Quit
@@ -1274,19 +1553,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateUsername; m.input.EchoMode = textinput.EchoNormal; m.input.SetValue(username); m.input.Focus()
 				return m, nil
 			}
-		case "x": if len(m.choices) > 0 && (m.state == stateSelect || m.state == stateError) { m.state = stateConfirmDelete }
+		case "x": 
+			if len(m.choices) > 0 && (m.state == stateSelect || m.state == stateError) { 
+				m.state = stateConfirmDelete 
+			}
 		case "y":
 			if m.state == stateConfirmDelete {
 				p := m.choices[m.cursor]
 				disconnectVPN(p) // also stops watchdog
+				deleteProfileCredentials(p)
 				os.Remove(filepath.Join(configDir, profileMap[p]))
 				m.state = stateSelect; if m.cursor >= len(m.choices) && m.cursor > 0 { m.cursor-- }
+			} else if m.state == stateConfirmOverwrite {
+				clearAllCustomCredentials()
+				saveSharedCredentials(m.tempUser, m.tempPass)
+				m.state = stateConnecting; p := m.choices[m.cursor]
+				return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
 			}
-		case "n", "esc": m.state = stateSelect; m.statusMsg = ""
-		case "tab":
-			if m.state == stateConnUser || m.state == stateConnPass {
-				m.applyAll = !m.applyAll
+		case "n":
+			if m.state == stateConfirmOverwrite {
+				saveSharedCredentials(m.tempUser, m.tempPass)
+				m.state = stateConnecting; p := m.choices[m.cursor]
+				return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
+			} else if m.state == stateConfirmDelete {
+				m.state = stateSelect
 			}
+		case "esc":
+			m.state = stateSelect; m.statusMsg = ""
 		case "enter":
 			if m.state == stateSelect || m.state == stateError {
 				if len(m.choices) == 0 { return m, nil }
@@ -1294,33 +1587,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if isProfileConnected(p) {
 					disconnectVPN(p) // stops watchdog + kills process
 				} else { 
+					if !profileRequiresAuth(p) {
+						m.state = stateConnecting
+						return m, func() tea.Msg { if err := connectVPN(p, "", ""); err != nil { return err }; return p }
+					}
 					m.state = stateConnUser; m.input.EchoMode = textinput.EchoNormal
 					m.input.Prompt = ""; val := sharedUser; if val == "" { val = username }
+					if hasProfileCredentials(p) {
+						val, _ = getProfileCredentials(p)
+						m.saveMode = 1
+					} else if sharedPass != "" {
+						m.saveMode = 0
+					} else {
+						m.saveMode = 2
+					}
 					m.input.SetValue(val); m.input.Focus()
 					m.input.SetCursor(len(val))
-					m.applyAll = (sharedPass != "")
 				}
-			} else if m.state == stateConnUser {
-				m.tempUser = m.input.Value()
-				m.state = stateConnPass; m.input.EchoMode = textinput.EchoPassword
-				m.input.Prompt = ""; m.input.SetValue(""); m.input.Focus()
-			} else if m.state == stateConnPass {
-				m.tempPass = m.input.Value()
-				// If input is empty but we have a shared password, use the shared one
-				if m.tempPass == "" && sharedPass != "" {
-					m.tempPass = sharedPass
-				}
-				m.state = stateConnecting; p := m.choices[m.cursor]
-				if m.applyAll { saveSharedCredentials(m.tempUser, m.tempPass) }
-				return m, func() tea.Msg { if err := connectVPN(p, m.tempUser, m.tempPass); err != nil { return err }; return p }
-			} else if m.state == stateRenameImport {
-				newName := strings.TrimSpace(m.input.Value())
-				if newName != "" {
-					newName = strings.TrimSuffix(newName, ".ovpn"); dst := filepath.Join(configDir, newName+".ovpn")
-					exec.Command("cp", m.importPath, dst).Run(); m.state = stateSelect
-				}
-			} else if m.state == stateUsername {
-				saveUsername(m.input.Value()); m.state = stateSelect
 			}
 		}
 	case error: m.state = stateError; m.statusMsg = msg.Error()
@@ -1373,7 +1656,7 @@ func (m model) View() string {
 	
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		titleStyle.Render(" RCP "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.4.0"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.4.2"),
 	) + "\n\n"
 
 	if m.state == stateRenameImport {
@@ -1446,9 +1729,25 @@ func (m model) View() string {
 	} else if m.state == stateConnUser || m.state == stateConnPass {
 		userDisplay := m.tempUser; if m.state == stateConnUser { userDisplay = m.input.View() }
 		passDisplay := strings.Repeat("*", len(m.tempPass)); if m.state == stateConnPass { passDisplay = m.input.View() }
-		cb := "[ ]"; if m.applyAll { cb = "[" + brightStyle.Render("x") + "]" }
-		body = fmt.Sprintf("Profile: %s\n\nUsername: %s\nPassword: %s\n\n%s Apply for this session [Tab]\n\n[Enter] Continue", 
-			brightStyle.Render(m.choices[m.cursor]), userDisplay, passDisplay, cb)
+		var modeStr string
+		switch m.saveMode {
+		case 0:
+			modeStr = brightStyle.Render("Apply for all profiles")
+		case 1:
+			modeStr = brightStyle.Render("Save for this profile only")
+		default:
+			modeStr = brightStyle.Render("Don't save")
+		}
+		body = fmt.Sprintf("Profile: %s\n\nUsername: %s\nPassword: %s\n\nSave Mode: %s [Tab to Change]\n\n[Enter] Continue", 
+			brightStyle.Render(m.choices[m.cursor]), userDisplay, passDisplay, modeStr)
+	} else if m.state == stateConfirmOverwrite {
+		customList := getProfilesWithCustomCredentials()
+		var listLines []string
+		for _, p := range customList {
+			listLines = append(listLines, "  • "+p)
+		}
+		body = fmt.Sprintf("Warning: The following profiles have custom credentials:\n%s\n\nOverwrite all custom credentials?\n\n[y] Overwrite All\n[n] Apply to others only (Keep custom)\n[Esc] Cancel", 
+			strings.Join(listLines, "\n"))
 	} else {
 		body = fmt.Sprintf("Profile: %s\n\nPassword Required:\n%s", m.choices[m.cursor], m.input.View())
 	}

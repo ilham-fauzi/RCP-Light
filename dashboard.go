@@ -91,15 +91,20 @@ func (d *Dashboard) Run() {
 			if iface != "" && iface == currentActiveInterface { isActive = true }
 			currentActiveIfaceMu.Unlock()
 
+			pUser, pPass := getProfileCredentials(p)
 			stats[p] = map[string]interface{}{
-				"connected":  connected,
-				"ip":         ip,
-				"down":       down,
-				"up":         up,
-				"latency":    lat,
-				"isPrimary":  isPrimary,
-				"isMoving":   isMoving,
-				"isActive":   isActive,
+				"connected":        connected,
+				"ip":               ip,
+				"down":             down,
+				"up":               up,
+				"latency":          lat,
+				"isPrimary":        isPrimary,
+				"isMoving":         isMoving,
+				"isActive":         isActive,
+				"requiresAuth":     profileRequiresAuth(p),
+				"hasProfileSaved":  hasProfileCredentials(p),
+				"profileUser":      pUser,
+				"profilePass":      pPass,
 			}
 		}
 
@@ -147,7 +152,7 @@ func (d *Dashboard) Run() {
 	})
 
 	d.w.Bind("importProfile", func() map[string]string {
-		script := `POSIX path of (choose file with prompt "Select an OVPN profile" of type {"ovpn", "com.openvpn.ovpn", "org.openvpn.ovpn"})`
+		script := `POSIX path of (choose file with prompt "Select an OVPN profile" of type {"ovpn", "public.data"})`
 		out, err := exec.Command("osascript", "-e", script).Output()
 		if err == nil {
 			src := strings.TrimSpace(string(out))
@@ -164,12 +169,31 @@ func (d *Dashboard) Run() {
 	d.w.Bind("saveImport", func(srcPath string, newName string) {
 		dst := filepath.Join(configDir, strings.TrimSpace(newName)+".ovpn")
 		exec.Command("cp", srcPath, dst).Run()
+		sanitizeOvpn(dst)
 		refreshProfiles()
 	})
 
 	d.w.Bind("deleteProfile", func(profile string) {
-		os.Remove(filepath.Join(configDir, profile+".ovpn"))
+		disconnectVPN(profile)
+		deleteProfileCredentials(profile)
+		filename := profileMap[profile]
+		if filename == "" {
+			filename = profile + ".ovpn"
+		}
+		os.Remove(filepath.Join(configDir, filename))
 		refreshProfiles()
+	})
+
+	d.w.Bind("saveProfileCredentials", func(profile string, u string, p string) {
+		saveProfileCredentials(profile, u, p)
+	})
+
+	d.w.Bind("deleteProfileCredentials", func(profile string) {
+		deleteProfileCredentials(profile)
+	})
+
+	d.w.Bind("clearAllCustomCredentials", func() {
+		clearAllCustomCredentials()
 	})
 
 	d.w.Bind("triggerOptimize", func() {
@@ -303,8 +327,12 @@ func (d *Dashboard) getHTML() string {
         .power-btn-inactive:hover #status-ring { border-color: rgba(0, 255, 136, 0.4) !important; }
         .power-btn-inactive:hover #power-icon-bg { background: rgba(0, 255, 136, 0.1) !important; }
         .power-btn-inactive:hover #power-icon { color: #00FF88 !important; }
-        #apply-to-all:checked + div .checked-icon { opacity: 1; }
-        #apply-to-all:checked + div { border-color: #5F5CF1; background: rgba(95, 92, 241, 0.1); }
+        #save-all:checked + div .checked-icon,
+        #save-one:checked + div .checked-icon,
+        #save-none:checked + div .checked-icon { opacity: 1; }
+        #save-all:checked + div,
+        #save-one:checked + div,
+        #save-none:checked + div { border-color: #5F5CF1; background: rgba(95, 92, 241, 0.1); }
         button:disabled { opacity: 0.5; cursor: not-allowed; filter: grayscale(1); }
         
         .shimmer { background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent); background-size: 200% 100%; animation: shimmer 2s infinite; }
@@ -326,7 +354,7 @@ func (d *Dashboard) getHTML() string {
         <header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-slate-950/60 backdrop-blur-md border-b border-white/10">
             <div class="flex items-center gap-3">
                 <img id="app-icon" src="" class="w-8 h-8 drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] hidden" />
-                <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.4.1</span>
+                <span class="text-white font-black tracking-tighter drop-shadow-[0_0_10px_rgba(95,92,241,0.5)] uppercase">RCP LIGHT V1.4.2</span>
             </div>
             <div class="flex gap-4 items-center">
                 <div onclick="openUsernameModal()" class="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10 hover:border-primary/50 cursor-pointer transition-all group">
@@ -446,17 +474,63 @@ func (d *Dashboard) getHTML() string {
                         <input id="vpn-password" type="password" placeholder="ENTER TOKEN" class="w-full bg-white/5 border-b border-white/20 p-2 text-xl tracking-[0.3em] outline-none focus:border-primary transition-all">
                     </div>
                     
-                    <label class="flex items-center gap-2 cursor-pointer group mt-1">
-                        <input id="apply-to-all" type="checkbox" class="hidden">
-                        <div class="w-4 h-4 rounded border border-white/20 group-hover:border-primary transition-all flex items-center justify-center">
-                            <div class="w-2 h-2 bg-primary rounded-sm opacity-0 transition-all checked-icon"></div>
-                        </div>
-                        <span class="text-[10px] text-outline group-hover:text-on-surface transition-all uppercase tracking-wider">Apply for this session</span>
-                    </label>
+                    <div class="flex flex-col gap-2 mt-1">
+                        <label class="flex items-center gap-2 cursor-pointer group">
+                            <input id="save-all" type="radio" name="save-mode" value="apply_all" class="hidden">
+                            <div class="w-4 h-4 rounded-full border border-white/20 group-hover:border-primary transition-all flex items-center justify-center">
+                                <div class="w-2 h-2 bg-primary rounded-full opacity-0 transition-all checked-icon"></div>
+                            </div>
+                            <span class="text-[10px] text-outline group-hover:text-on-surface transition-all uppercase tracking-wider">Apply to all profiles</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer group">
+                            <input id="save-one" type="radio" name="save-mode" value="save_profile" class="hidden">
+                            <div class="w-4 h-4 rounded-full border border-white/20 group-hover:border-primary transition-all flex items-center justify-center">
+                                <div class="w-2 h-2 bg-primary rounded-full opacity-0 transition-all checked-icon"></div>
+                            </div>
+                            <span class="text-[10px] text-outline group-hover:text-on-surface transition-all uppercase tracking-wider">Save for this profile only</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer group">
+                            <input id="save-none" type="radio" name="save-mode" value="none" class="hidden">
+                            <div class="w-4 h-4 rounded-full border border-white/20 group-hover:border-primary transition-all flex items-center justify-center">
+                                <div class="w-2 h-2 bg-primary rounded-full opacity-0 transition-all checked-icon"></div>
+                            </div>
+                            <span class="text-[10px] text-outline group-hover:text-on-surface transition-all uppercase tracking-wider">Don't save</span>
+                        </label>
+                    </div>
 
                     <button id="auth-btn" class="w-full py-4 bg-primary text-white font-bold rounded-lg uppercase tracking-widest shadow-lg active:scale-95 transition-all mt-2">Authorize Connection</button>
                     <div class="h-2"></div>
                     <button onclick="closeModal()" class="w-full text-[10px] text-outline uppercase hover:text-white transition-colors py-2">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="credentials-overwrite-modal" class="fixed inset-0 z-[120] hidden flex items-center justify-center bg-surface/90 backdrop-blur-md">
+            <div class="w-full max-w-md mx-4 glass-panel rounded-xl overflow-hidden shadow-2xl border border-red-500/20">
+                <div class="p-6 border-b border-white/5">
+                    <span class="text-[10px] font-label-caps text-red-500 uppercase tracking-widest">Conflicting Credentials</span>
+                    <h1 class="text-xl font-bold text-on-surface mt-1">APPLY FOR ALL PROFILES</h1>
+                </div>
+                <div class="p-6 flex flex-col gap-4">
+                    <p class="text-xs text-outline leading-relaxed">
+                        The following profiles have their own saved custom credentials:
+                    </p>
+                    <div id="overwrite-profiles-list" class="max-h-24 overflow-y-auto bg-black/20 rounded p-3 font-mono text-[11px] text-primary/80 flex flex-col gap-1">
+                        <!-- Filled dynamically -->
+                    </div>
+                    <p class="text-xs text-outline leading-relaxed">
+                        Do you want to overwrite all of them, or only apply to profiles without custom credentials?
+                    </p>
+                    
+                    <button id="overwrite-all-btn" class="w-full py-3 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg uppercase tracking-wider text-xs active:scale-95 transition-all">
+                        Overwrite All
+                    </button>
+                    <button id="overwrite-partial-btn" class="w-full py-3 bg-primary hover:bg-primary-hover text-white font-bold rounded-lg uppercase tracking-wider text-xs active:scale-95 transition-all">
+                        Only Apply to Others (Keep Custom)
+                    </button>
+                    <button onclick="closeOverwriteModal()" class="w-full py-2 text-outline uppercase hover:text-white transition-colors text-[10px] text-center block">
+                        Cancel
+                    </button>
                 </div>
             </div>
         </div>
@@ -717,7 +791,12 @@ func (d *Dashboard) getHTML() string {
         function handleAction(p, connected) {
             if (connected) { disconnect(p); refresh(); } 
             else { 
-                openPasswordModal(p); 
+                const s = currentStats[p] || {};
+                if (s.requiresAuth === false) {
+                    performConnect(p, "", "");
+                } else {
+                    openPasswordModal(p); 
+                }
             }
         }
 
@@ -737,7 +816,13 @@ func (d *Dashboard) getHTML() string {
                 errDiv.classList.remove('hidden');
                 sharedPassword = ''; 
                 sharedUsername = '';
-                // Don't call openPasswordModal here as it's already open and would reset the error state
+                const modal = document.getElementById('password-modal');
+                if (modal.classList.contains('hidden')) {
+                    document.getElementById('modal-profile-name').innerText = 'Profile: ' + p;
+                    document.getElementById('vpn-username').value = '';
+                    document.getElementById('vpn-password').value = '';
+                    modal.classList.remove('hidden');
+                }
             } else { 
                 closeModal(); 
             }
@@ -755,43 +840,110 @@ func (d *Dashboard) getHTML() string {
             selectedProfile = p;
             document.getElementById('modal-profile-name').innerText = 'Profile: ' + p;
             
+            const s = currentStats[p] || {};
             const userField = document.getElementById('vpn-username');
-            userField.value = sharedUsername || globalUsername;
-            
             const passField = document.getElementById('vpn-password');
-            passField.value = sharedPassword || ''; // Pre-fill synced token visually
             
-            document.getElementById('apply-to-all').checked = !!sharedPassword;
+            if (s.hasProfileSaved) {
+                userField.value = s.profileUser;
+                passField.value = s.profilePass;
+                document.getElementById('save-one').checked = true;
+            } else {
+                userField.value = sharedUsername || globalUsername;
+                passField.value = sharedPassword || '';
+                if (sharedPassword) {
+                    document.getElementById('save-all').checked = true;
+                } else {
+                    document.getElementById('save-none').checked = true;
+                }
+            }
+            
             document.getElementById('password-modal').classList.remove('hidden');
             
             if (document.getElementById('auth-btn').innerText !== 'AUTHORIZING...') {
                 document.getElementById('auth-error').classList.add('hidden');
             }
             
-            // Focus and select username
             userField.focus();
             userField.select();
         }
 
         function closeModal() { document.getElementById('password-modal').classList.add('hidden'); }
 
+        let pendingConnectUser = '';
+        let pendingConnectPass = '';
+        let pendingConnectMode = '';
+
+        function closeOverwriteModal() {
+            document.getElementById('credentials-overwrite-modal').classList.add('hidden');
+            const btn = document.getElementById('auth-btn');
+            btn.innerText = 'Authorize Connection';
+            btn.disabled = false;
+        }
+
+        async function doConfirmOverwrite(overwriteAll) {
+            if (overwriteAll) {
+                await clearAllCustomCredentials();
+            }
+            document.getElementById('credentials-overwrite-modal').classList.add('hidden');
+            
+            if (pendingConnectMode === 'apply_all') {
+                sharedUsername = pendingConnectUser;
+                sharedPassword = pendingConnectPass;
+                await saveCredentials(pendingConnectUser, pendingConnectPass);
+                await deleteProfileCredentials(selectedProfile);
+            }
+            await performConnect(selectedProfile, pendingConnectUser, pendingConnectPass);
+        }
+
+        document.getElementById('overwrite-all-btn').onclick = () => doConfirmOverwrite(true);
+        document.getElementById('overwrite-partial-btn').onclick = () => doConfirmOverwrite(false);
+
         document.getElementById('auth-btn').onclick = async () => {
             const user = document.getElementById('vpn-username').value.trim();
-            let pwd = document.getElementById('vpn-password').value;
-            
-            // If user left password empty, use the shared one from background
-            if (!pwd && sharedPassword) {
-                pwd = sharedPassword;
-            }
+            const pwd = document.getElementById('vpn-password').value;
             
             if (!user || !pwd) return;
             
-            if (document.getElementById('apply-to-all').checked) {
-                sharedPassword = pwd;
-                sharedUsername = user;
-            } else {
-                sharedPassword = '';
+            let mode = 'none';
+            if (document.getElementById('save-all').checked) mode = 'apply_all';
+            else if (document.getElementById('save-one').checked) mode = 'save_profile';
+            
+            if (mode === 'apply_all') {
+                const conflictProfiles = [];
+                Object.keys(currentStats).forEach(pk => {
+                    if (currentStats[pk].hasProfileSaved) {
+                        conflictProfiles.push(pk);
+                    }
+                });
+                
+                if (conflictProfiles.length > 0) {
+                    pendingConnectUser = user;
+                    pendingConnectPass = pwd;
+                    pendingConnectMode = 'apply_all';
+                    
+                    const listEl = document.getElementById('overwrite-profiles-list');
+                    listEl.innerHTML = '';
+                    conflictProfiles.forEach(item => {
+                        const div = document.createElement('div');
+                        div.innerText = '• ' + item;
+                        listEl.appendChild(div);
+                    });
+                    
+                    document.getElementById('credentials-overwrite-modal').classList.remove('hidden');
+                    return;
+                } else {
+                    sharedUsername = user;
+                    sharedPassword = pwd;
+                    await saveCredentials(user, pwd);
+                    await deleteProfileCredentials(selectedProfile);
+                }
+            } else if (mode === 'save_profile') {
+                await saveProfileCredentials(selectedProfile, user, pwd);
                 sharedUsername = '';
+                sharedPassword = '';
+            } else {
+                await deleteProfileCredentials(selectedProfile);
             }
             
             await performConnect(selectedProfile, user, pwd);
@@ -887,6 +1039,11 @@ func (d *Dashboard) getHTML() string {
             }
         };
 
+        document.getElementById('vpn-username').onkeydown = (e) => {
+            if (e.key === 'Enter') document.getElementById('auth-btn').click();
+            if (e.key === 'Escape') closeModal();
+        };
+
         document.getElementById('vpn-password').onkeydown = (e) => {
             if (e.key === 'Enter') document.getElementById('auth-btn').click();
             if (e.key === 'Escape') closeModal();
@@ -920,7 +1077,7 @@ func (d *Dashboard) getHTML() string {
                     }
                 }
             }
-            if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); closeProbeModal(); }
+            if (e.key === 'Escape') { closeModal(); closeRenameModal(); closeUsernameModal(); closeProbeModal(); closeOverwriteModal(); }
         });
 
         async function manualOptimize() {

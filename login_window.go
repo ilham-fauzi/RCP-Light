@@ -123,11 +123,11 @@ import (
 type loginResult struct {
 	user     string
 	password string
-	applyAll bool
+	saveMode string // "apply_all", "save_profile", "none"
 	canceled bool
 }
 
-func showLoginWindow(profile string, defaultUser string, defaultPass string) loginResult {
+func showLoginWindow(profile string, defaultUser string, defaultPass string, saveMode string) loginResult {
 	result := loginResult{canceled: true}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -136,12 +136,12 @@ func showLoginWindow(profile string, defaultUser string, defaultPass string) log
 	defer w.Destroy()
 
 	w.SetTitle("RCP Light")
-	w.SetSize(360, 420, webview.HintFixed)
+	w.SetSize(360, 480, webview.HintFixed)
 	C.login_frame(w.Window()) // frame only — before content
 	C.login_menu()            // Enable copy/paste
 
-	w.Bind("_onSubmit", func(user string, password string, applyAll bool) {
-		result = loginResult{user: user, password: password, applyAll: applyAll, canceled: false}
+	w.Bind("_onSubmit", func(user string, password string, mode string) {
+		result = loginResult{user: user, password: password, saveMode: mode, canceled: false}
 		w.Terminate()
 		wg.Done()
 	})
@@ -150,22 +150,33 @@ func showLoginWindow(profile string, defaultUser string, defaultPass string) log
 		w.Terminate()
 		wg.Done()
 	})
+	w.Bind("_getProfilesWithCustomCredentials", func() []string {
+		return getProfilesWithCustomCredentials()
+	})
+	w.Bind("_clearAllCustomCredentials", func() {
+		clearAllCustomCredentials()
+	})
 
-	w.SetHtml(loginHTML(profile, defaultUser, defaultPass))
+	w.SetHtml(loginHTML(profile, defaultUser, defaultPass, saveMode))
 	C.login_glass(w.Window()) // glass AFTER SetHtml so WKWebView subview exists
 	C.login_focus(w.Window())
 	w.Run()
 	return result
 }
 
-func loginHTML(profile, defaultUser string, defaultPass string) string {
+func loginHTML(profile, defaultUser string, defaultPass string, saveMode string) string {
 	iconBase64 := base64.StdEncoding.EncodeToString(iconData)
 	html := strings.ReplaceAll(loginTemplate, "{{PROFILE}}", profile)
 	html = strings.ReplaceAll(html, "{{DEFAULT_USER}}", defaultUser)
 	html = strings.ReplaceAll(html, "{{DEFAULT_PASS}}", defaultPass)
 	html = strings.ReplaceAll(html, "{{ICON_BASE64}}", iconBase64)
-	if defaultPass != "" {
-		html = strings.ReplaceAll(html, "id=\"a\">", "id=\"a\" checked>")
+	
+	if saveMode == "apply_all" {
+		html = strings.ReplaceAll(html, "id=\"save_all\"", "id=\"save_all\" checked")
+	} else if saveMode == "save_profile" {
+		html = strings.ReplaceAll(html, "id=\"save_one\"", "id=\"save_one\" checked")
+	} else {
+		html = strings.ReplaceAll(html, "id=\"save_none\"", "id=\"save_none\" checked")
 	}
 	return html
 }
@@ -284,6 +295,82 @@ input[readonly]{opacity:0.6;cursor:default}
 .check-row:hover .check-label{color:rgba(255,255,255,.7)}
 .lock-ico{font-size:10px;margin-left:auto;opacity:.4}
 
+/* Prompt Modal styles */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(15, 15, 17, 0.95);
+  backdrop-filter: blur(12px);
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 24px;
+  z-index: 9999;
+}
+.modal-overlay.on {
+  display: flex;
+}
+.modal-content {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  padding: 20px;
+  width: 100%;
+  max-height: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.modal-title {
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; color: #ff6b6b;
+}
+.modal-desc {
+  font-size: 11px; color: rgba(255, 255, 255, 0.7); line-height: 1.45;
+}
+.modal-list {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  font-family: monospace;
+  color: #a5a2fb;
+  max-height: 80px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.modal-btn-overwrite {
+  width: 100%; padding: 10px;
+  background: #ff6b6b; border: none; border-radius: 6px;
+  color: #fff; font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  cursor: pointer; transition: all 0.2s ease;
+  box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);
+}
+.modal-btn-overwrite:hover {
+  background: #ff7c7c; transform: translateY(-1px);
+}
+.modal-btn-keep {
+  width: 100%; padding: 10px;
+  background: #5F5CF1; border: none; border-radius: 6px;
+  color: #fff; font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  cursor: pointer; transition: all 0.2s ease;
+  box-shadow: 0 4px 15px rgba(95, 92, 241, 0.3);
+}
+.modal-btn-keep:hover {
+  background: #6e6cf2; transform: translateY(-1px);
+}
+.modal-btn-cancel {
+  background: none; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 6px;
+  color: rgba(255, 255, 255, 0.5); font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+  cursor: pointer; padding: 8px; transition: color 0.18s;
+}
+.modal-btn-cancel:hover {
+  color: rgba(255, 255, 255, 0.8); border-color: rgba(255, 255, 255, 0.4);
+}
+
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
@@ -317,11 +404,23 @@ input[readonly]{opacity:0.6;cursor:default}
         <button class="eye" id="eye" onclick="toggleEye()" tabindex="-1">👁</button>
       </div>
     </div>
-    <label class="check-row">
-      <input type="checkbox" id="a">
-      <span class="check-box"></span>
-      <span class="check-label">Apply for all profile</span>
-    </label>
+    <div style="display: flex; flex-direction: column; gap: 8px; margin: 4px 0;">
+      <label class="check-row">
+        <input type="radio" name="save_mode" id="save_all" value="apply_all">
+        <span class="check-box" style="border-radius: 50%;"></span>
+        <span class="check-label">Apply to all profiles</span>
+      </label>
+      <label class="check-row">
+        <input type="radio" name="save_mode" id="save_one" value="save_profile">
+        <span class="check-box" style="border-radius: 50%;"></span>
+        <span class="check-label">Save for this profile only</span>
+      </label>
+      <label class="check-row">
+        <input type="radio" name="save_mode" id="save_none" value="none">
+        <span class="check-box" style="border-radius: 50%;"></span>
+        <span class="check-label">Don't save</span>
+      </label>
+    </div>
   </div>
 
   <div class="err" id="err"></div>
@@ -333,19 +432,26 @@ input[readonly]{opacity:0.6;cursor:default}
     <div style="height: 8px"></div> <!-- Extra space below cancel -->
   </div>
 
+  <div class="modal-overlay" id="conflict-modal">
+    <div class="modal-content">
+      <div class="modal-title">Conflicting Credentials</div>
+      <div class="modal-desc">The following profiles have their own saved credentials:</div>
+      <div class="modal-list" id="conflict-list"></div>
+      <div class="modal-desc">Do you want to overwrite all custom credentials, or only apply to profiles without saved credentials?</div>
+      <button class="modal-btn-overwrite" onclick="confirmOverwrite(true)">Overwrite All</button>
+      <button class="modal-btn-keep" onclick="confirmOverwrite(false)">Only Apply to Others (Keep Custom)</button>
+      <button class="modal-btn-cancel" onclick="closeConflictModal()">Cancel</button>
+    </div>
+  </div>
+
 <script>
+let pendingUser = '';
+let pendingPass = '';
+
 window.addEventListener('load', () => {
   const u = document.getElementById('u');
   const p = document.getElementById('p');
-  // Always focus username first as requested, but if it has value, 
-  // allow user to see it then they can tab to password or we can focus password after a tiny delay
   u.focus();
-  if(u.value) {
-    // If username is already there, we focus it but let user tab to password.
-    // Or we can just focus password if username is readonly and filled.
-    // However, the user specifically asked for focus on username column.
-  }
-
 
   [u, p].forEach(el => {
     el.addEventListener('keydown', e => {
@@ -355,8 +461,6 @@ window.addEventListener('load', () => {
   });
 });
 
-
-
 function toggleEye() {
   const p = document.getElementById('p');
   const btn = document.getElementById('eye');
@@ -364,17 +468,55 @@ function toggleEye() {
   btn.textContent = p.type === 'password' ? '👁' : '🙈';
 }
 
+function closeConflictModal() {
+  document.getElementById('conflict-modal').classList.remove('on');
+  const btn = document.getElementById('btn');
+  btn.textContent = 'Connect';
+  btn.disabled = false;
+}
+
+async function confirmOverwrite(overwriteAll) {
+  if (overwriteAll) {
+    await _clearAllCustomCredentials();
+  }
+  document.getElementById('conflict-modal').classList.remove('on');
+  await _onSubmit(pendingUser, pendingPass, 'apply_all');
+}
+
 async function go() {
   const u = document.getElementById('u').value.trim();
   const p = document.getElementById('p').value;
-  const a = document.getElementById('a').checked;
+  
+  let mode = 'none';
+  if (document.getElementById('save_all').checked) mode = 'apply_all';
+  else if (document.getElementById('save_one').checked) mode = 'save_profile';
+
   const err = document.getElementById('err');
   err.classList.remove('on');
   if (!u) { err.textContent='Username is required.'; err.classList.add('on'); document.getElementById('u').focus(); return; }
   if (!p)  { err.textContent='Token / Password is required.'; err.classList.add('on'); document.getElementById('p').focus(); return; }
+  
   const btn = document.getElementById('btn');
   btn.textContent='Connecting…'; btn.disabled=true;
-  await _onSubmit(u, p, a);
+  
+  if (mode === 'apply_all') {
+    const list = await _getProfilesWithCustomCredentials();
+    if (list && list.length > 0) {
+      pendingUser = u;
+      pendingPass = p;
+      const listEl = document.getElementById('conflict-list');
+      listEl.innerHTML = '';
+      list.forEach(item => {
+        const div = document.createElement('div');
+        div.textContent = '• ' + item;
+        listEl.appendChild(div);
+      });
+      document.getElementById('conflict-modal').classList.add('on');
+      return;
+    }
+  }
+  
+  await _onSubmit(u, p, mode);
 }
 </script>
 </body>
