@@ -1656,7 +1656,7 @@ func (m model) View() string {
 	
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		titleStyle.Render(" RCP "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.4.2"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.5.0"),
 	) + "\n\n"
 
 	if m.state == stateRenameImport {

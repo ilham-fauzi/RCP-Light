@@ -3,9 +3,10 @@
 APP_NAME="RCP Light"
 APP_DIR="${APP_NAME}.app"
 BINARY_NAME="rcp-light"
+VERSION="1.5.0"
 
 echo "------------------------------------------"
-echo "🚀 Building ${APP_NAME} - Lite Edition"
+echo "🚀 Building ${APP_NAME} v${VERSION}"
 echo "------------------------------------------"
 
 # 1. Cleanup
@@ -70,12 +71,13 @@ cat << PLIST > "${APP_DIR}/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.2</string>
+    <string>${VERSION}</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
 </plist>
 
 echo "------------------------------------------"
-echo "✅ SUCCESS! Lite Bundle created: ${APP_DIR}"
+echo "✅ SUCCESS! ${APP_DIR} created (v${VERSION})"
+echo "  open ${APP_DIR}"
 echo "------------------------------------------"
