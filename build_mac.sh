@@ -3,7 +3,7 @@
 APP_NAME="RCP Light"
 APP_DIR="${APP_NAME}.app"
 BINARY_NAME="rcp-light"
-VERSION="1.5.0"
+VERSION="2.0.0"
 
 echo "------------------------------------------"
 echo "🚀 Building ${APP_NAME} v${VERSION}"

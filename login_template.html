@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:transparent;color:#fff;font-family:-apple-system,'SF Pro Text','Inter',sans-serif;-webkit-font-smoothing:antialiased;user-select:none;overflow:hidden}
+body{display:flex;flex-direction:column;justify-content:flex-start;padding:24px 28px 20px;gap:12px;-webkit-app-region:drag;background:rgba(25,25,27,0.85)}
+.chip{-webkit-app-region:no-drag;align-self:center;margin-bottom:2px;font-size:9px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.5);background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);border-radius:999px;padding:3px 12px}
+.fields{display:flex;flex-direction:column;gap:10px;-webkit-app-region:no-drag}
+.field{display:flex;flex-direction:column;gap:4px}
+.label{font-size:8.5px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:rgba(255,255,255,.45)}
+.row{display:flex;align-items:center;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:7px 12px;transition:all .2s ease}
+.row:focus-within{border-color:#5F5CF1;background:rgba(255,255,255,.09);box-shadow:0 0 0 2px rgba(95,92,241,.2)}
+input{flex:1;background:transparent;border:none;outline:none;color:#fff;font-size:14px;font-family:inherit;-webkit-user-select:text;user-select:text}
+input::placeholder{color:rgba(255,255,255,.3)}
+.eye{background:none;border:none;cursor:pointer;font-size:14px;color:rgba(255,255,255,.4);padding:2px;transition:color .2s}
+.eye:hover{color:rgba(255,255,255,.8)}
+.check-group{display:flex;gap:16px;margin:2px 0 4px;align-items:center}
+.check-group .check-row{margin:0}
+.check-row{display:flex;align-items:center;gap:10px;cursor:pointer;-webkit-app-region:no-drag;user-select:none}
+.check-row input{display:none}
+.check-box{width:16px;height:16px;border-radius:4px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0}
+.check-row:hover .check-box{border-color:rgba(255,255,255,.4);background:rgba(255,255,255,.08)}
+.check-row input:checked+.check-box{background:#5F5CF1;border-color:#5F5CF1;box-shadow:0 0 10px rgba(95,92,241,.3)}
+.check-box::after{content:'';width:5px;height:9px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg) translate(-1px,-1px);display:none}
+.check-row input:checked+.check-box::after{display:block}
+.check-label{font-size:10px;color:rgba(255,255,255,.4);font-weight:600;letter-spacing:.03em;text-transform:uppercase}
+.check-row:hover .check-label{color:rgba(255,255,255,.7)}
+.field-save{display:flex;align-items:center;cursor:pointer;flex-shrink:0;margin-left:8px;-webkit-app-region:no-drag}
+.field-save input{display:none}
+.field-save .check-box{opacity:.55}
+.field-save:hover .check-box{opacity:.8;border-color:rgba(255,255,255,.4);background:rgba(255,255,255,.08)}
+.field-save input:checked+.check-box{opacity:1;background:#5F5CF1;border-color:#5F5CF1;box-shadow:0 0 10px rgba(95,92,241,.3)}
+.field-save input:checked+.check-box::after{display:block}
+.err{display:none;font-size:11px;color:#ff6b6b;text-align:center;font-weight:500}
+.err.on{display:block}
+.actions{display:flex;flex-direction:column;gap:6px;-webkit-app-region:no-drag;margin-top:4px}
+.btn-main{width:100%;padding:11px;background:#5F5CF1;border:none;border-radius:8px;color:#fff;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:all .2s ease;box-shadow:0 4px 15px rgba(95,92,241,.4)}
+.btn-main:hover:not(:disabled){background:#6e6cf2;transform:translateY(-1px);box-shadow:0 6px 20px rgba(95,92,241,.5)}
+.btn-main:active:not(:disabled){transform:scale(.98)}
+.btn-main:disabled{opacity:.45;cursor:not-allowed}
+.btn-cancel{background:none;border:none;color:rgba(255,255,255,.4);font-size:10.5px;cursor:pointer;padding:8px;transition:color .18s;font-family:inherit;letter-spacing:.02em}
+.btn-cancel:hover{color:rgba(255,255,255,.7)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.chip{animation:fadeIn .5s cubic-bezier(.16,1,.3,1) both}
+.fields{animation:fadeIn .5s cubic-bezier(.16,1,.3,1) .1s both}
+.actions{animation:fadeIn .5s cubic-bezier(.16,1,.3,1) .2s both}
+</style>
+</head>
+<body>
+<div class="header" style="display:flex;flex-direction:column;align-items:center;margin-bottom:-4px">
+<img src="data:image/png;base64,{{ICON_BASE64}}" style="width:52px;height:52px;filter:drop-shadow(0 0 10px rgba(95,92,241,.5))"/>
+<h1 style="font-size:15px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:white;text-shadow:0 0 10px rgba(95,92,241,.5);margin-top:8px">RCP Light</h1>
+</div>
+<div class="chip">{{PROFILE}}</div>
+<div class="fields">
+<div class="field"><div class="label">Username</div>
+<div class="row"><input id="u" type="text" placeholder="Username" value="{{DEFAULT_USER}}" autocomplete="off" spellcheck="false" style="padding-left:4px"/>
+<label class="field-save"><input type="checkbox" id="su"><span class="check-box"></span></label>
+</div></div>
+<div class="field"><div class="label">Token / Password</div>
+<div class="row"><input id="p" type="password" placeholder="Enter token or password" autocomplete="off" value="{{DEFAULT_PASS}}" style="padding-left:4px"/>
+<button class="eye" id="eye" onclick="toggleEye()" tabindex="-1">&#x1F441;</button>
+<label class="field-save"><input type="checkbox" id="sp"><span class="check-box"></span></label>
+</div></div>
+<div class="check-group">
+<label class="check-row"><input type="checkbox" id="a"><span class="check-box"></span><span class="check-label">Apply for all</span></label>
+<label class="check-row"><input type="checkbox" id="f"><span class="check-box"></span><span class="check-label">This profile only</span></label>
+</div></div>
+<div class="err" id="err"></div>
+<div class="actions"><button class="btn-main" id="btn" onclick="go()">Connect</button>
+<div style="height:4px"></div><button class="btn-cancel" onclick="_onCancel()">Cancel</button>
+<div style="height:8px"></div></div>
+<script>
+window.addEventListener('load',()=>{document.getElementById('u').focus();[document.getElementById('u'),document.getElementById('p')].forEach(el=>{el.addEventListener('keydown',e=>{if(e.key==='Enter')go();if(e.key==='Escape')_onCancel()})})});
+function toggleEye(){var p=document.getElementById('p');p.type=p.type==='password'?'text':'password'}
+async function go(){
+var u=document.getElementById('u').value.trim();
+var p=document.getElementById('p').value;
+var su=document.getElementById('su').checked;
+var sp=document.getElementById('sp').checked;
+var a=(su||sp)?document.getElementById('a').checked:false;
+var f=(su||sp)?document.getElementById('f').checked:false;
+var err=document.getElementById('err');
+err.classList.remove('on');
+if(!u&&!p){err.textContent='Username or Password is required.';err.classList.add('on');document.getElementById('u').focus();return}
+var btn=document.getElementById('btn');
+btn.textContent='Connecting\u2026';btn.disabled=true;
+await _onSubmit(u,p,a,f,su,sp);
+}
+</script>
+</body></html>

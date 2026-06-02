@@ -54,6 +54,12 @@ type vpnCred struct {
 	pass string
 }
 
+type trayProfileItem struct {
+	parent  *systray.MenuItem
+	connect *systray.MenuItem
+	delete  *systray.MenuItem
+}
+
 type TrayProfileItem struct {
 	item    *systray.MenuItem
 	profile string
@@ -167,63 +173,76 @@ func saveSharedCredentials(u, p string) {
 	os.WriteFile(path, []byte(u+"\n"+p), 0600)
 }
 
-func getProfileCredentials(profile string) (string, string) {
+type profileCredState struct {
+	user, pass                  string
+	su, sp, applyAll, saveProf bool
+}
+
+func getProfileCredState(profile string) profileCredState {
+	s := profileCredState{}
 	path := filepath.Join(configDir, profile+".cred")
 	content, err := os.ReadFile(path)
-	if err == nil {
-		lines := strings.Split(string(content), "\n")
-		if len(lines) >= 2 {
-			return strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1])
+	if err != nil { return s }
+	lines := strings.Split(string(content), "\n")
+	if len(lines) >= 2 { s.user = strings.TrimSpace(lines[0]); s.pass = strings.TrimSpace(lines[1]) }
+	hasCb := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		switch line {
+		case "su=1": s.su = true; hasCb = true
+		case "su=0": hasCb = true
+		case "sp=1": s.sp = true; hasCb = true
+		case "sp=0": hasCb = true
+		case "a=1": s.applyAll = true; hasCb = true
+		case "a=0": hasCb = true
+		case "f=1": s.saveProf = true; hasCb = true
+		case "f=0": hasCb = true
 		}
 	}
-	return "", ""
+	if !hasCb { if s.user != "" { s.su = true }; if s.pass != "" { s.sp = true } }
+	return s
+}
+
+func getProfileCredentials(profile string) (string, string) {
+	s := getProfileCredState(profile); return s.user, s.pass
 }
 
 func hasProfileCredentials(profile string) bool {
-	path := filepath.Join(configDir, profile+".cred")
-	_, err := os.Stat(path)
+	_, err := os.Stat(filepath.Join(configDir, profile+".cred"))
 	return err == nil
 }
 
-func saveProfileCredentials(profile string, u, p string) {
+func saveProfileCredentials(profile, u, p string) { saveProfileCredentialsFull(profile, u, p, true, true, false, false) }
+
+func saveProfileCredentialsFull(profile, u, p string, su, sp, applyAll, saveProf bool) {
+	var lines []string
+	if u != "" { lines = append(lines, u) } else { lines = append(lines, "") }
+	if p != "" { lines = append(lines, p) } else { lines = append(lines, "") }
+	if su { lines = append(lines, "su=1") } else { lines = append(lines, "su=0") }
+	if sp { lines = append(lines, "sp=1") } else { lines = append(lines, "sp=0") }
+	if applyAll { lines = append(lines, "a=1") } else { lines = append(lines, "a=0") }
+	if saveProf { lines = append(lines, "f=1") } else { lines = append(lines, "f=0") }
 	path := filepath.Join(configDir, profile+".cred")
-	os.WriteFile(path, []byte(u+"\n"+p), 0600)
+	os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0600)
 }
 
 func deleteProfileCredentials(profile string) {
-	path := filepath.Join(configDir, profile+".cred")
-	os.Remove(path)
+	os.Remove(filepath.Join(configDir, profile+".cred"))
 }
 
 func getProfilesWithCustomCredentials() []string {
 	var list []string
-	entries, err := os.ReadDir(configDir)
-	if err != nil {
-		return list
-	}
+	entries, _ := os.ReadDir(configDir)
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") {
-			name := strings.TrimSuffix(entry.Name(), ".cred")
-			if name != "session" {
-				list = append(list, name)
-			}
-		}
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") && entry.Name() != "session.cred" { list = append(list, strings.TrimSuffix(entry.Name(), ".cred")) }
 	}
 	return list
 }
 
 func clearAllCustomCredentials() {
-	entries, err := os.ReadDir(configDir)
-	if err != nil {
-		return
-	}
+	entries, _ := os.ReadDir(configDir)
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") {
-			name := strings.TrimSuffix(entry.Name(), ".cred")
-			if name != "session" {
-				os.Remove(filepath.Join(configDir, entry.Name()))
-			}
-		}
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".cred") && entry.Name() != "session.cred" { os.Remove(filepath.Join(configDir, entry.Name())) }
 	}
 }
 
@@ -411,37 +430,22 @@ func main() {
 		}
 		defU := sharedUser; if defU == "" { defU = username }
 		defP := sharedPass
-		saveMode := "apply_all"
-		if hasProfileCredentials(profile) {
-			defU, defP = getProfileCredentials(profile)
-			saveMode = "save_profile"
-		} else if sharedPass == "" {
-			saveMode = "none"
-		}
-		
-		res := showLoginWindow(profile, defU, defP, saveMode)
+		st := getProfileCredState(profile)
+		if st.user != "" { defU = st.user; defP = st.pass }
+		res := showLoginWindow(profile, defU, defP, st.su, st.sp, st.applyAll, st.saveProf)
 		if !res.canceled {
-			if res.saveMode == "apply_all" {
-				saveSharedCredentials(res.user, res.password)
-				deleteProfileCredentials(profile)
-			} else if res.saveMode == "save_profile" {
-				saveProfileCredentials(profile, res.user, res.password)
-			} else {
-				deleteProfileCredentials(profile)
+			if res.applyAll { saveSharedCredentials(res.user, res.password) }
+			if res.saveProfile || res.saveUser || res.savePass {
+				saveProfileCredentialsFull(profile, res.user, res.password, res.saveUser, res.savePass, res.applyAll, res.saveProfile)
 			}
 			connectVPN(profile, res.user, res.password)
 		}
 		return
 	}
 
-	if len(os.Args) > 1 && (os.Args[1] == "ui" || os.Args[1] == "mini" || os.Args[1] == "dashboard") {
+	if len(os.Args) > 1 && (os.Args[1] == "ui" || os.Args[1] == "mini") {
 		if os.Args[1] == "mini" { miniMode = true }
 		startBackgroundSync()
-		if os.Args[1] == "dashboard" {
-			d := &Dashboard{}
-			d.Run()
-			return
-		}
 
 		if os.Args[1] == "ui" {
 			rows := 15 + len(profiles)
@@ -459,10 +463,6 @@ func main() {
 	}
 }
 
-func openDashboard() {
-	exe, _ := os.Executable()
-	exec.Command(exe, "dashboard").Start()
-}
 
 var (
 	activeLoginCmd *exec.Cmd
@@ -495,6 +495,27 @@ func openLoginWindowSubprocess(profile string) {
 		}
 		activeLoginMu.Unlock()
 	}(cmd)
+}
+
+func importProfileTray() {
+	script := `POSIX path of (choose file with prompt "Select an OVPN profile" of type {"ovpn", "com.openvpn.ovpn", "org.openvpn.ovpn"})`
+	out, err := exec.Command("osascript", "-e", script).Output()
+	if err != nil { return }
+	src := strings.TrimSpace(string(out))
+	if src == "" { return }
+	ext := strings.ToLower(filepath.Ext(src))
+	if ext != ".ovpn" { return }
+	name := strings.TrimSuffix(filepath.Base(src), ext)
+	dst := filepath.Join(configDir, name+".ovpn")
+	data, err := os.ReadFile(src)
+	if err != nil { return }
+	os.WriteFile(dst, data, 0644)
+	exe, _ := os.Executable()
+	appPath := exe
+	if strings.Contains(exe, ".app/Contents/MacOS/") { appPath = exe[:strings.Index(exe, ".app/")+4] }
+	exec.Command("open", "-n", appPath).Start()
+	time.Sleep(300 * time.Millisecond)
+	os.Exit(0)
 }
 
 func openTUI() {
@@ -1286,39 +1307,17 @@ func disconnectVPN(profile string) {
 func onTrayReady() {
 	systray.SetIcon(trayIconData)
 	systray.SetTitle("")
-	mOpenDashboard := systray.AddMenuItem("Open RCP Light Dashboard", "")
 	mOpenUI := systray.AddMenuItem("Open Terminal UI", "")
 	systray.AddSeparator()
-
-	// Pre-create the pool of dynamic profile items
-	for i := 0; i < 50; i++ {
-		item := systray.AddMenuItem("", "")
-		item.Hide()
-		trayItems[i] = &TrayProfileItem{
-			item:    item,
-			profile: "",
-		}
-		
-		go func(index int, tItem *TrayProfileItem) {
-			for range tItem.item.ClickedCh {
-				trayItemsMu.Lock()
-				p := tItem.profile
-				trayItemsMu.Unlock()
-				if p == "" { continue }
-				
-				if isProfileConnected(p) {
-					disconnectVPN(p)
-				} else {
-					if !profileRequiresAuth(p) {
-						connectVPN(p, "", "")
-					} else {
-						openLoginWindowSubprocess(p)
-					}
-				}
-			}
-		}(i, trayItems[i])
+	trayItems := make(map[string]*trayProfileItem)
+	for _, p := range profiles {
+		parent := systray.AddMenuItem(p, "")
+		connect := parent.AddSubMenuItem("Connect", "")
+		del := parent.AddSubMenuItem("Delete", "")
+		trayItems[p] = &trayProfileItem{parent: parent, connect: connect, delete: del}
 	}
-
+	systray.AddSeparator()
+	mImport := systray.AddMenuItem("Import OVPN Profile", "")
 	systray.AddSeparator()
 	mLastEvent := systray.AddMenuItem("Ready", "")
 	mLastEvent.Disable()
@@ -1326,78 +1325,65 @@ func onTrayReady() {
 	mQuit := systray.AddMenuItem("Quit", "")
 
 	updateTray := func() {
-		trayItemsMu.Lock()
-		defer trayItemsMu.Unlock()
-
-		// 1. Assign active profiles to slots
-		for i := 0; i < 50; i++ {
-			if i < len(profiles) {
-				trayItems[i].profile = profiles[i]
-			} else {
-				trayItems[i].profile = ""
-			}
-		}
-
-		// 2. Update titles, checks, and visibility
 		activeCount := 0
-		for i := 0; i < 50; i++ {
-			p := trayItems[i].profile
-			if p == "" {
-				trayItems[i].item.Hide()
-				continue
-			}
-
+		for _, p := range profiles {
 			connected := isProfileConnected(p)
 			title := p
+			ti, ok := trayItems[p]; if !ok { continue }
 			if connected {
 				activeCount++
-				trayItems[i].item.Check()
-				
+				ti.connect.SetTitle("Disconnect")
 				orchestratorMu.Lock()
 				isPrimary := (p == lastWinner)
 				orchestratorMu.Unlock()
-				
 				ip := getVPNIPFromLog(p)
 				iface := findInterfaceByIP(ip)
 				currentActiveIfaceMu.Lock()
 				isActive := (iface != "" && iface == currentActiveInterface)
 				currentActiveIfaceMu.Unlock()
-				
 				isMoving := false
-				if s, ok := globalNetStats[p]; ok {
-					if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true }
-				}
-				
+				if s, ok := globalNetStats[p]; ok { if s.InSpeed > 1024 || s.OutSpeed > 512 { isMoving = true } }
+				title = "\u25CF " + title
 				if isPrimary { title += " [PRIMARY]" }
 				if isActive { title += " [ACTIVE]" }
 				if isMoving { title += " [TRANS]" }
 			} else {
-				trayItems[i].item.Uncheck()
+				ti.connect.SetTitle("Connect")
+				title = "\u25CB " + title
 			}
-			trayItems[i].item.SetTitle(title)
-			trayItems[i].item.Show()
+			ti.parent.SetTitle(title)
 		}
-
 		auditMu.Lock()
-		if len(auditLogs) > 0 {
-			mLastEvent.SetTitle("Event: " + auditLogs[len(auditLogs)-1].Message)
-		}
+		if len(auditLogs) > 0 { mLastEvent.SetTitle("Event: " + auditLogs[len(auditLogs)-1].Message) }
 		auditMu.Unlock()
-
 		if activeCount > 0 { systray.SetTitle(fmt.Sprintf(" %d", activeCount)) } else { systray.SetTitle("") }
 	}
-
-	go func() {
-		for {
-			select {
-			case <-mOpenDashboard.ClickedCh: openDashboard()
-			case <-mOpenUI.ClickedCh: openTUI()
-			case <-mQuit.ClickedCh: systray.Quit()
+	for _, p := range profiles {
+		go func(p string, ti *trayProfileItem) {
+			for {
+				select {
+				case <-ti.connect.ClickedCh:
+					if isProfileConnected(p) { disconnectVPN(p) } else if profileRequiresAuth(p) { openLoginWindowSubprocess(p) } else { connectVPN(p, "", "") }
+				case <-ti.delete.ClickedCh:
+					script := fmt.Sprintf(`display dialog "Delete profile '%s'?\n\nThis will remove the .ovpn file, credentials, and logs." buttons {"Cancel", "Delete"} default button "Cancel" with icon caution`, p)
+					out, _ := exec.Command("osascript", "-e", script).Output()
+					if !strings.Contains(string(out), "Delete") { continue }
+					disconnectVPN(p)
+					os.Remove(filepath.Join(configDir, p+".ovpn"))
+					os.Remove(filepath.Join(configDir, p+".pid"))
+					os.Remove(filepath.Join(configDir, p+".log"))
+					os.Remove(filepath.Join(configDir, p+".cred"))
+					refreshProfiles()
+					ti.parent.Hide()
+				}
+				updateTray()
 			}
-		}
-	}()
-	go func() { for { time.Sleep(1 * time.Second); updateTray() } }()
+		}(p, trayItems[p])
+	}
+	go func() { for { select { case <-mOpenUI.ClickedCh: openTUI(); case <-mImport.ClickedCh: importProfileTray(); case <-mQuit.ClickedCh: systray.Quit() } } }()
+	go func() { for { time.Sleep(3 * time.Second); updateTray() } }()
 }
+
 
 const (
 	stateSelect = iota
@@ -1656,7 +1642,7 @@ func (m model) View() string {
 	
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		titleStyle.Render(" RCP "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V1.5.0"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5CF1")).Padding(0, 1).Render("Light V2.0.0"),
 	) + "\n\n"
 
 	if m.state == stateRenameImport {
